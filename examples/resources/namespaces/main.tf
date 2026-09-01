@@ -1,20 +1,22 @@
 terraform {
   required_providers {
-    odigos = {
-      source = "registry.terraform.io/odigos/odigos"
+    odigos-central = {
+      source = "registry.terraform.io/odigos/odigos-central"
     }
   }
 }
 
-provider "odigos" {
+provider "odigos-central" {
   hostname = "localhost:8081"
   username = var.username
   password = var.password
-  insecure = true
+
+  # A local Central usually serves a self-signed certificate.
+  insecure_skip_verify = true
 }
 
 # Select a namespace for instrumentation and set its current data stream.
-resource "odigos_namespace" "example" {
+resource "odigos-central_namespace" "example" {
   cluster_name        = "LocalCluster"
   name                = "kv-mall"
   current_stream_name = "default"
@@ -22,10 +24,10 @@ resource "odigos_namespace" "example" {
 
 output "namespace" {
   description = "The selected namespace and its computed attributes from the Odigos API."
-  value       = odigos_namespace.example
+  value       = odigos-central_namespace.example
 }
 
 output "namespace_sources" {
   description = "Sources (workloads) in this namespace."
-  value       = odigos_namespace.example.sources
+  value       = odigos-central_namespace.example.sources
 }

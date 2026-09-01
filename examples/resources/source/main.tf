@@ -1,18 +1,18 @@
 terraform {
   required_providers {
-    odigos = {
-      source = "registry.terraform.io/odigos/odigos"
+    odigos-central = {
+      source = "registry.terraform.io/odigos/odigos-central"
     }
   }
 }
 
-provider "odigos" {
+provider "odigos-central" {
   hostname = "odigos-central.example.com:8081"
   username = var.username
   password = var.password
 }
 
-resource "odigos_source" "instrument" {
+resource "odigos-central_source" "instrument" {
   cluster_name        = "my-cluster"
   name                = "my-deployment"
   kind                = "Deployment"
@@ -21,5 +21,5 @@ resource "odigos_source" "instrument" {
 }
 
 output "resource_central_backend" {
-  value = odigos_source.instrument
+  value = odigos-central_source.instrument
 }

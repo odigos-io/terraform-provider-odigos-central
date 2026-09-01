@@ -1,9 +1,10 @@
-# NOTE: This file is for HashiCorp specific licensing automation and can be deleted after creating a new repo with this template.
+# Copyright header configuration for https://github.com/hashicorp/copywrite
 schema_version = 1
 
 project {
-  license        = "MPL-2.0"
-  copyright_year = 2021
+  license          = "Apache-2.0"
+  copyright_year   = 2026
+  copyright_holder = "Odigos"
 
   header_ignore = [
     # internal catalog metadata (prose)

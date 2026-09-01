@@ -1,3 +1,6 @@
+// Copyright (c) Odigos
+// SPDX-License-Identifier: Apache-2.0
+
 //go:build generate
 
 package tools
@@ -16,4 +19,4 @@ import (
 //go:generate terraform fmt -recursive ../examples/
 
 // Generate documentation.
-//go:generate go run github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs generate --provider-dir .. -provider-name odigos
+//go:generate go run github.com/hashicorp/terraform-plugin-docs/cmd/tfplugindocs generate --provider-dir .. -provider-name odigos-central

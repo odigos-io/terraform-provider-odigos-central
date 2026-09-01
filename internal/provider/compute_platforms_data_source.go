@@ -1,3 +1,6 @@
+// Copyright (c) Odigos
+// SPDX-License-Identifier: Apache-2.0
+
 package provider
 
 import (
@@ -7,7 +10,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
-	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
@@ -47,6 +49,7 @@ func (d *computePlatformsDataSource) Metadata(_ context.Context, req datasource.
 
 func (d *computePlatformsDataSource) Schema(_ context.Context, _ datasource.SchemaRequest, resp *datasource.SchemaResponse) {
 	resp.Schema = schema.Schema{
+		MarkdownDescription: "Lists compute platforms (clusters) registered with Odigos Central.",
 		Attributes: map[string]schema.Attribute{
 			"compute_platforms": schema.ListNestedAttribute{
 				Computed: true,
@@ -105,7 +108,6 @@ func (d *computePlatformsDataSource) Configure(_ context.Context, req datasource
 	if req.ProviderData == nil {
 		return
 	}
-
 	client, ok := req.ProviderData.(*cachedOdigosClient)
 	if !ok {
 		resp.Diagnostics.AddError(
@@ -114,7 +116,6 @@ func (d *computePlatformsDataSource) Configure(_ context.Context, req datasource
 		)
 		return
 	}
-
 	d.client = client
 }
 
@@ -133,24 +134,25 @@ func (d *computePlatformsDataSource) Read(ctx context.Context, req datasource.Re
 	}
 
 	for _, cluster := range platforms {
-		users, usersDiags := anySliceToStrings(cluster.Users)
-		resp.Diagnostics.Append(usersDiags...)
-		teams, teamsDiags := anySliceToStrings(cluster.Teams)
-		resp.Diagnostics.Append(teamsDiags...)
-
-		userElems := make([]attr.Value, len(users))
-		for i, u := range users {
-			userElems[i] = types.StringValue(u)
+		userElems := make([]attr.Value, len(cluster.Users))
+		for i, u := range cluster.Users {
+			userElems[i] = types.StringValue(u.Username)
 		}
 		usersList, listDiags := types.ListValue(types.StringType, userElems)
 		resp.Diagnostics.Append(listDiags...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
 
-		teamElems := make([]attr.Value, len(teams))
-		for i, t := range teams {
-			teamElems[i] = types.StringValue(t)
+		teamElems := make([]attr.Value, len(cluster.Teams))
+		for i, t := range cluster.Teams {
+			teamElems[i] = types.StringValue(t.Name)
 		}
 		teamsList, listDiags := types.ListValue(types.StringType, teamElems)
 		resp.Diagnostics.Append(listDiags...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
 
 		state.ComputePlatforms = append(state.ComputePlatforms, computePlatformsModel{
 			Id:            types.StringValue(cluster.ID),
@@ -171,25 +173,4 @@ func (d *computePlatformsDataSource) Read(ctx context.Context, req datasource.Re
 	if resp.Diagnostics.HasError() {
 		return
 	}
-}
-
-// anySliceToStrings converts []any from the API to []string, skipping non-string elements.
-// It returns a diagnostic warning when any element is skipped.
-func anySliceToStrings(in []any) ([]string, diag.Diagnostics) {
-	var diags diag.Diagnostics
-	if in == nil {
-		return nil, diags
-	}
-	out := make([]string, 0, len(in))
-	for _, v := range in {
-		if s, ok := v.(string); ok {
-			out = append(out, s)
-		} else {
-			diags.AddWarning(
-				"Compute Platform List Element Skipped",
-				fmt.Sprintf("Expected string in users/teams list but got %T; skipping non-string element.", v),
-			)
-		}
-	}
-	return out, diags
 }

@@ -1,0 +1,1 @@
+data "odigos-central_compute_platforms" "example" {}

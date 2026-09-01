@@ -1,3 +1,6 @@
+// Copyright (c) Odigos
+// SPDX-License-Identifier: Apache-2.0
+
 package provider
 
 import (
@@ -10,39 +13,27 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
-	"github.com/hashicorp/terraform-plugin-testing/echoprovider"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 )
 
 // testAccProtoV6ProviderFactories is used to instantiate a provider during acceptance testing.
-// The factory function is called for each Terraform CLI command to create a provider
-// server that the CLI can connect to and interact with.
 var testAccProtoV6ProviderFactories = map[string]func() (tfprotov6.ProviderServer, error){
-	"odigos": providerserver.NewProtocol6WithError(New("test")()),
+	"odigos-central": providerserver.NewProtocol6WithError(New("test")()),
 }
 
-// testAccProtoV6ProviderFactoriesWithEcho includes the echo provider alongside the odigos provider.
-// It allows for testing assertions on data returned by an ephemeral resource during Open.
-// The echoprovider is used to arrange tests by echoing ephemeral data into the Terraform state.
-// This lets the data be referenced in test assertions with state checks.
-var testAccProtoV6ProviderFactoriesWithEcho = map[string]func() (tfprotov6.ProviderServer, error){
-	"odigos": providerserver.NewProtocol6WithError(New("test")()),
-	"echo":   echoprovider.NewProviderServer(),
-}
-
-func testAccPreCheck(t *testing.T) {
-	// You can add code here to run prior to any test case execution, for example assertions
-	// about the appropriate environment variables being set are common to see in a pre-check
-	// function.
-}
-
-// startMockOdigosServer starts an httptest.Server that mimics the Odigos GraphQL API:
-// - SignIn mutation returns a valid access token.
-// - GetComputePlatforms query returns an empty list.
-// Returns the server and the hostname to use in the provider (host:port, no scheme).
+// startMockOdigosServer starts an httptest TLS server that mimics the Odigos
+// GraphQL API well enough to satisfy the provider's Configure-time handshake:
+//   - SignIn returns a valid access token.
+//   - GetSystemConfig reports a Central version >= MinCentralVersion.
+//   - GetComputePlatforms returns an empty list (no clusters).
+//
+// The server speaks HTTPS with a self-signed certificate because the provider
+// always uses HTTPS, so test configs must set insecure_skip_verify = true.
+//
+// Returns the server and the hostname (host:port, no scheme) for the provider block.
 func startMockOdigosServer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/graphql" || r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -57,34 +48,30 @@ func startMockOdigosServer(t *testing.T) (*httptest.Server, string) {
 		query := strings.TrimSpace(body.Query)
 		switch {
 		case strings.Contains(query, "signIn") || strings.Contains(query, "SignIn"):
-			// Auth response
 			_, _ = w.Write([]byte(`{"data":{"signIn":{"accessToken":"mock-token","idToken":"","status":"","user":{},"__typename":""}},"errors":[]}`))
+		case strings.Contains(query, "systemConfig") || strings.Contains(query, "GetSystemConfig"):
+			_, _ = w.Write([]byte(`{"data":{"systemConfig":{"isInitialized":true,"version":"v1.22.0"}},"errors":[]}`))
 		case strings.Contains(query, "computePlatforms") || strings.Contains(query, "GetComputePlatforms"):
-			// GetComputePlatforms response
 			_, _ = w.Write([]byte(`{"data":{"computePlatforms":[]},"errors":[]}`))
 		default:
-			// Generic success for other operations
 			_, _ = w.Write([]byte(`{"data":{},"errors":[]}`))
 		}
 	}))
-	// Hostname for provider: "host:port" without scheme (client adds http:// when insecure)
-	hostname := strings.TrimPrefix(server.URL, "http://")
+	hostname := strings.TrimPrefix(server.URL, "https://")
 	return server, hostname
 }
 
 func TestAccProviderNoHostname(t *testing.T) {
-	// Assumes ODIGOS_* env vars are not set; provider has no hostname and fails with "Missing hostname".
 	resource.Test(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
-				// Data source only to trigger provider Configure; we assert only on provider error.
-				Config: `provider "odigos" {
+				Config: `provider "odigos-central" {
   username = "user"
   password = "secret"
-  insecure = true
+  insecure_skip_verify = true
 }
-data "odigos_compute_platforms" "_" {}`,
+data "odigos-central_compute_platforms" "_" {}`,
 				ExpectError: mustRegex("Missing Odigos API Hostname|hostname"),
 			},
 		},
@@ -99,12 +86,12 @@ func TestAccProviderMissingPassword(t *testing.T) {
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
-				Config: `provider "odigos" {
+				Config: `provider "odigos-central" {
   hostname = "` + hostname + `"
   username = "user"
-  insecure = true
+  insecure_skip_verify = true
 }
-data "odigos_compute_platforms" "_" {}`,
+data "odigos-central_compute_platforms" "_" {}`,
 				ExpectError: mustRegex("Missing Odigos API Password|password"),
 			},
 		},
@@ -119,22 +106,17 @@ func TestAccProviderMissingUsername(t *testing.T) {
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
-				Config: `provider "odigos" {
+				Config: `provider "odigos-central" {
   hostname = "` + hostname + `"
   password = "secret"
-  insecure = true
+  insecure_skip_verify = true
 }
-data "odigos_compute_platforms" "_" {}`,
+data "odigos-central_compute_platforms" "_" {}`,
 				ExpectError: mustRegex("Missing Odigos API Username|username"),
 			},
 		},
 	})
 }
-
-// Success-case tests below have no Check: they pass only if the step completes
-// without error. That implies the provider Configure ran, the API client was
-// created, and auth with the mock server succeeded. If any of that failed,
-// Terraform would error and the test would fail.
 
 func TestAccProviderUsernamePassword(t *testing.T) {
 	server, hostname := startMockOdigosServer(t)
@@ -144,21 +126,18 @@ func TestAccProviderUsernamePassword(t *testing.T) {
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
-				Config: `provider "odigos" {
+				Config: `provider "odigos-central" {
   hostname = "` + hostname + `"
   username = "testuser"
   password = "testpass"
-  insecure = true
+  insecure_skip_verify = true
 }
-data "odigos_compute_platforms" "_" {}`,
-				// Asserts success by step not erroring (provider config + client auth succeed).
+data "odigos-central_compute_platforms" "_" {}`,
 			},
 		},
 	})
 }
 
-// TestAccProviderConfigFromEnv verifies the provider uses ODIGOS_* env vars when
-// the provider block omits hostname/username/password. Asserts success by step not erroring.
 func TestAccProviderConfigFromEnv(t *testing.T) {
 	server, hostname := startMockOdigosServer(t)
 	defer server.Close()
@@ -171,17 +150,15 @@ func TestAccProviderConfigFromEnv(t *testing.T) {
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
-				Config: `provider "odigos" {
-  insecure = true
+				Config: `provider "odigos-central" {
+  insecure_skip_verify = true
 }
-data "odigos_compute_platforms" "_" {}`,
+data "odigos-central_compute_platforms" "_" {}`,
 			},
 		},
 	})
 }
 
-// TestAccProviderConfigOverridesEnv verifies config block values override env vars
-// (wrong hostname in env; correct hostname in config). Asserts success by step not erroring.
 func TestAccProviderConfigOverridesEnv(t *testing.T) {
 	server, hostname := startMockOdigosServer(t)
 	defer server.Close()
@@ -194,13 +171,150 @@ func TestAccProviderConfigOverridesEnv(t *testing.T) {
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
-				Config: `provider "odigos" {
+				Config: `provider "odigos-central" {
+  hostname = "` + hostname + `"
+  username = "testuser"
+  password = "testpass"
+  insecure_skip_verify = true
+}
+data "odigos-central_compute_platforms" "_" {}`,
+			},
+		},
+	})
+}
+
+// TestAccProviderRejectsOldCentral verifies the version-handshake hard fail
+// surfaces a clear "upgrade Central" diagnostic.
+func TestAccProviderRejectsOldCentral(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/graphql" || r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var body struct {
+			Query string `json:"query"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		q := strings.TrimSpace(body.Query)
+		switch {
+		case strings.Contains(q, "SignIn") || strings.Contains(q, "signIn"):
+			_, _ = w.Write([]byte(`{"data":{"signIn":{"accessToken":"mock-token","idToken":"","status":"","user":{}}},"errors":[]}`))
+		case strings.Contains(q, "systemConfig") || strings.Contains(q, "GetSystemConfig"):
+			_, _ = w.Write([]byte(`{"data":{"systemConfig":{"isInitialized":true,"version":"v1.18.0"}},"errors":[]}`))
+		default:
+			_, _ = w.Write([]byte(`{"data":{},"errors":[]}`))
+		}
+	}))
+	defer server.Close()
+	hostname := strings.TrimPrefix(server.URL, "https://")
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `provider "odigos-central" {
+  hostname = "` + hostname + `"
+  username = "u"
+  password = "p"
+  insecure_skip_verify = true
+}
+data "odigos-central_compute_platforms" "_" {}`,
+				ExpectError: mustRegex("Odigos Central Version Not Supported|requires Odigos Central"),
+			},
+		},
+	})
+}
+
+// TestAccProviderRejectsInsecureArgument verifies the plain-HTTP escape hatch is
+// not reachable from configuration. The provider must never downgrade to HTTP,
+// so "insecure" is not a valid argument and Terraform should reject the config.
+func TestAccProviderRejectsInsecureArgument(t *testing.T) {
+	server, hostname := startMockOdigosServer(t)
+	defer server.Close()
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `provider "odigos-central" {
   hostname = "` + hostname + `"
   username = "testuser"
   password = "testpass"
   insecure = true
 }
-data "odigos_compute_platforms" "_" {}`,
+data "odigos-central_compute_platforms" "_" {}`,
+				ExpectError: mustRegex(`An argument named "insecure" is not expected here|Unsupported argument`),
+			},
+		},
+	})
+}
+
+// TestAccProviderVerifiesTLSByDefault asserts that omitting insecure_skip_verify
+// leaves certificate verification on: the mock server's self-signed certificate
+// must be rejected rather than silently trusted.
+func TestAccProviderVerifiesTLSByDefault(t *testing.T) {
+	server, hostname := startMockOdigosServer(t)
+	defer server.Close()
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `provider "odigos-central" {
+  hostname = "` + hostname + `"
+  username = "testuser"
+  password = "testpass"
+}
+data "odigos-central_compute_platforms" "_" {}`,
+				ExpectError: mustRegex("certificate|x509|tls"),
+			},
+		},
+	})
+}
+
+// TestAccProviderInsecureSkipVerifyFromEnv verifies ODIGOS_INSECURE_SKIP_VERIFY
+// is honored when the attribute is absent from the configuration.
+func TestAccProviderInsecureSkipVerifyFromEnv(t *testing.T) {
+	server, hostname := startMockOdigosServer(t)
+	defer server.Close()
+
+	t.Setenv("ODIGOS_INSECURE_SKIP_VERIFY", "true")
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `provider "odigos-central" {
+  hostname = "` + hostname + `"
+  username = "testuser"
+  password = "testpass"
+}
+data "odigos-central_compute_platforms" "_" {}`,
+			},
+		},
+	})
+}
+
+// TestAccProviderInsecureSkipVerifyInvalidEnv verifies a non-boolean
+// ODIGOS_INSECURE_SKIP_VERIFY produces a clear diagnostic rather than being
+// silently ignored.
+func TestAccProviderInsecureSkipVerifyInvalidEnv(t *testing.T) {
+	server, hostname := startMockOdigosServer(t)
+	defer server.Close()
+
+	t.Setenv("ODIGOS_INSECURE_SKIP_VERIFY", "yes-please")
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `provider "odigos-central" {
+  hostname = "` + hostname + `"
+  username = "testuser"
+  password = "testpass"
+}
+data "odigos-central_compute_platforms" "_" {}`,
+				ExpectError: mustRegex("Invalid ODIGOS_INSECURE_SKIP_VERIFY Value"),
 			},
 		},
 	})

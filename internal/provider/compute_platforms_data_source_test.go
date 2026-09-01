@@ -1,3 +1,6 @@
+// Copyright (c) Odigos
+// SPDX-License-Identifier: Apache-2.0
+
 package provider
 
 import (
@@ -15,7 +18,7 @@ import (
 // Returns the server and the hostname to use in the provider (host:port, no scheme).
 func startMockOdigosServerForDataSource(t *testing.T, computePlatformsResponse string) (*httptest.Server, string) {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/graphql" || r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -31,6 +34,8 @@ func startMockOdigosServerForDataSource(t *testing.T, computePlatformsResponse s
 		switch {
 		case strings.Contains(query, "signIn") || strings.Contains(query, "SignIn"):
 			_, _ = w.Write([]byte(`{"data":{"signIn":{"accessToken":"mock-token","idToken":"","status":"","user":{},"__typename":""}},"errors":[]}`))
+		case strings.Contains(query, "systemConfig") || strings.Contains(query, "GetSystemConfig"):
+			_, _ = w.Write([]byte(`{"data":{"systemConfig":{"isInitialized":true,"version":"v1.22.0"}},"errors":[]}`))
 		case strings.Contains(query, "computePlatforms") || strings.Contains(query, "GetComputePlatforms"):
 			// Wrap the provided array in the full response structure
 			_, _ = w.Write([]byte(`{"data":{"computePlatforms":` + computePlatformsResponse + `},"errors":[]}`))
@@ -38,7 +43,7 @@ func startMockOdigosServerForDataSource(t *testing.T, computePlatformsResponse s
 			_, _ = w.Write([]byte(`{"data":{},"errors":[]}`))
 		}
 	}))
-	hostname := strings.TrimPrefix(server.URL, "http://")
+	hostname := strings.TrimPrefix(server.URL, "https://")
 	return server, hostname
 }
 
@@ -55,7 +60,7 @@ func TestAccOdigosComputePlatformsDataSource_Empty(t *testing.T) {
 			{
 				Config: testAccOdigosComputePlatformsDataSourceConfig(hostname),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr("data.odigos_compute_platforms.example", "compute_platforms.#", "0"),
+					resource.TestCheckResourceAttr("data.odigos-central_compute_platforms.example", "compute_platforms.#", "0"),
 				),
 			},
 		},
@@ -63,7 +68,7 @@ func TestAccOdigosComputePlatformsDataSource_Empty(t *testing.T) {
 }
 
 // onePlatformResponse is the raw JSON array of one compute platform for the mock API.
-const onePlatformResponse = `[{"id":"cluster-1","name":"TestCluster","odigosVersion":"1.2.3","type":"kubernetes","status":"connected","connectedAt":1700000000,"lastSeenAt":1700000100,"users":["u1@example.com"],"teams":["team-a"],"__typename":"ComputePlatform"}]`
+const onePlatformResponse = `[{"id":"cluster-1","name":"TestCluster","odigosVersion":"1.2.3","type":"kubernetes","status":"connected","connectedAt":1700000000,"lastSeenAt":1700000100,"users":[{"id":"u1","email":"u1@example.com","username":"user1","role":"admin"}],"teams":[{"id":"t1","name":"team-a"}],"__typename":"ComputePlatform"}]`
 
 func TestAccOdigosComputePlatformsDataSource_OnePlatform(t *testing.T) {
 	server, hostname := startMockOdigosServerForDataSource(t, onePlatformResponse)
@@ -75,19 +80,19 @@ func TestAccOdigosComputePlatformsDataSource_OnePlatform(t *testing.T) {
 			{
 				Config: testAccOdigosComputePlatformsDataSourceConfig(hostname),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr("data.odigos_compute_platforms.example", "compute_platforms.#", "1"),
-					resource.TestCheckResourceAttr("data.odigos_compute_platforms.example", "compute_platforms.0.id", "cluster-1"),
-					resource.TestCheckResourceAttr("data.odigos_compute_platforms.example", "compute_platforms.0.name", "TestCluster"),
-					resource.TestCheckResourceAttr("data.odigos_compute_platforms.example", "compute_platforms.0.odigos_version", "1.2.3"),
-					resource.TestCheckResourceAttr("data.odigos_compute_platforms.example", "compute_platforms.0.type", "kubernetes"),
-					resource.TestCheckResourceAttr("data.odigos_compute_platforms.example", "compute_platforms.0.status", "connected"),
-					resource.TestCheckResourceAttr("data.odigos_compute_platforms.example", "compute_platforms.0.connected_at", "1700000000"),
-					resource.TestCheckResourceAttr("data.odigos_compute_platforms.example", "compute_platforms.0.last_seen_at", "1700000100"),
-					resource.TestCheckResourceAttr("data.odigos_compute_platforms.example", "compute_platforms.0.type_name", "ComputePlatform"),
-					resource.TestCheckResourceAttr("data.odigos_compute_platforms.example", "compute_platforms.0.users.#", "1"),
-					resource.TestCheckResourceAttr("data.odigos_compute_platforms.example", "compute_platforms.0.users.0", "u1@example.com"),
-					resource.TestCheckResourceAttr("data.odigos_compute_platforms.example", "compute_platforms.0.teams.#", "1"),
-					resource.TestCheckResourceAttr("data.odigos_compute_platforms.example", "compute_platforms.0.teams.0", "team-a"),
+					resource.TestCheckResourceAttr("data.odigos-central_compute_platforms.example", "compute_platforms.#", "1"),
+					resource.TestCheckResourceAttr("data.odigos-central_compute_platforms.example", "compute_platforms.0.id", "cluster-1"),
+					resource.TestCheckResourceAttr("data.odigos-central_compute_platforms.example", "compute_platforms.0.name", "TestCluster"),
+					resource.TestCheckResourceAttr("data.odigos-central_compute_platforms.example", "compute_platforms.0.odigos_version", "1.2.3"),
+					resource.TestCheckResourceAttr("data.odigos-central_compute_platforms.example", "compute_platforms.0.type", "kubernetes"),
+					resource.TestCheckResourceAttr("data.odigos-central_compute_platforms.example", "compute_platforms.0.status", "connected"),
+					resource.TestCheckResourceAttr("data.odigos-central_compute_platforms.example", "compute_platforms.0.connected_at", "1700000000"),
+					resource.TestCheckResourceAttr("data.odigos-central_compute_platforms.example", "compute_platforms.0.last_seen_at", "1700000100"),
+					resource.TestCheckResourceAttr("data.odigos-central_compute_platforms.example", "compute_platforms.0.type_name", "ComputePlatform"),
+					resource.TestCheckResourceAttr("data.odigos-central_compute_platforms.example", "compute_platforms.0.users.#", "1"),
+					resource.TestCheckResourceAttr("data.odigos-central_compute_platforms.example", "compute_platforms.0.users.0", "user1"),
+					resource.TestCheckResourceAttr("data.odigos-central_compute_platforms.example", "compute_platforms.0.teams.#", "1"),
+					resource.TestCheckResourceAttr("data.odigos-central_compute_platforms.example", "compute_platforms.0.teams.0", "team-a"),
 				),
 			},
 		},
@@ -95,7 +100,7 @@ func TestAccOdigosComputePlatformsDataSource_OnePlatform(t *testing.T) {
 }
 
 func TestAccOdigosComputePlatformsDataSource_ApiError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/graphql" || r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -109,6 +114,10 @@ func TestAccOdigosComputePlatformsDataSource_ApiError(t *testing.T) {
 			_, _ = w.Write([]byte(`{"data":{"signIn":{"accessToken":"mock-token","idToken":"","status":"","user":{},"__typename":""}},"errors":[]}`))
 			return
 		}
+		if strings.Contains(query, "systemConfig") || strings.Contains(query, "GetSystemConfig") {
+			_, _ = w.Write([]byte(`{"data":{"systemConfig":{"isInitialized":true,"version":"v1.22.0"}},"errors":[]}`))
+			return
+		}
 		if strings.Contains(query, "computePlatforms") || strings.Contains(query, "GetComputePlatforms") {
 			// Simulate API error for compute platforms query
 			_, _ = w.Write([]byte(`{"data":null,"errors":[{"message":"internal server error"}]}`))
@@ -117,7 +126,7 @@ func TestAccOdigosComputePlatformsDataSource_ApiError(t *testing.T) {
 		_, _ = w.Write([]byte(`{"data":{},"errors":[]}`))
 	}))
 	defer server.Close()
-	hostname := strings.TrimPrefix(server.URL, "http://")
+	hostname := strings.TrimPrefix(server.URL, "https://")
 
 	resource.Test(t, resource.TestCase{
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
@@ -131,13 +140,13 @@ func TestAccOdigosComputePlatformsDataSource_ApiError(t *testing.T) {
 }
 
 func testAccOdigosComputePlatformsDataSourceConfig(hostname string) string {
-	return `provider "odigos" {
+	return `provider "odigos-central" {
   hostname = "` + hostname + `"
   username = "testuser"
   password = "testpass"
-  insecure = true
+  insecure_skip_verify = true
 }
 
-data "odigos_compute_platforms" "example" {}
+data "odigos-central_compute_platforms" "example" {}
 `
 }

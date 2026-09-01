@@ -1,3 +1,6 @@
+// Copyright (c) Odigos
+// SPDX-License-Identifier: Apache-2.0
+
 package provider
 
 import (
@@ -11,22 +14,23 @@ import (
 )
 
 // startMockOdigosServerForSource starts an httptest.Server that supports the source resource:
-// signIn, GetComputePlatforms (one platform so getClusterID works), and RemoteFetch for
-// GetSource and PersistSources. computePlatformsJSON is the array for computePlatforms (e.g. one platform with id and name).
-// Returns server and hostname for the provider.
+//   - signIn returns a valid access token.
+//   - GetSystemConfig reports a Central version >= MinCentralVersion.
+//   - GetComputePlatforms returns the supplied JSON list.
+//   - RemoteFetch handles GetSource and PersistSources operations.
+//
+// computePlatformsJSON is the JSON array body of the computePlatforms field.
+// Returns the server and hostname (no scheme) for the provider block.
 func startMockOdigosServerForSource(t *testing.T, computePlatformsJSON string) (*httptest.Server, string) {
 	t.Helper()
 
-	// Inner response for GetSource: sourceResponse shape (type, data.computePlatform.source, request_id).
 	innerSourceResponse := func(namespace, name, kind, otelServiceName string, dataStreamNames []string) string {
 		streams, _ := json.Marshal(dataStreamNames)
 		return `{"type":"","data":{"computePlatform":{"source":{"namespace":"` + namespace + `","name":"` + name + `","kind":"` + kind + `","dataStreamNames":` + string(streams) + `,"selected":true,"otelServiceName":"` + otelServiceName + `","containers":[],"conditions":[]}}},"request_id":""}`
 	}
-
-	// Inner response for PersistSources.
 	innerPersistResponse := `{"type":"","data":{"persistK8sSources":true},"request_id":""}`
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/graphql" || r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -43,17 +47,19 @@ func startMockOdigosServerForSource(t *testing.T, computePlatformsJSON string) (
 		switch {
 		case strings.Contains(query, "signIn") || strings.Contains(query, "SignIn"):
 			_, _ = w.Write([]byte(`{"data":{"signIn":{"accessToken":"mock-token","idToken":"","status":"","user":{},"__typename":""}},"errors":[]}`))
+		case strings.Contains(query, "systemConfig") || strings.Contains(query, "GetSystemConfig"):
+			_, _ = w.Write([]byte(`{"data":{"systemConfig":{"isInitialized":true,"version":"v1.22.0"}},"errors":[]}`))
 		case strings.Contains(query, "computePlatforms") || strings.Contains(query, "GetComputePlatforms"):
 			_, _ = w.Write([]byte(`{"data":{"computePlatforms":` + computePlatformsJSON + `},"errors":[]}`))
 		case strings.Contains(query, "remoteFetch") || strings.Contains(query, "RemoteFetch"):
 			innerQuery, _ := body.Variables["query"].(string)
 			var inner string
-			if strings.Contains(innerQuery, "source(sourceId") || strings.Contains(innerQuery, "GetSource") {
-				// Return a source matching typical create (namespace, name, kind from variables if present)
+			switch {
+			case strings.Contains(innerQuery, "source(sourceId") || strings.Contains(innerQuery, "GetSource"):
 				inner = innerSourceResponse("default", "my-deploy", "Deployment", "my-deploy-default", []string{"default"})
-			} else if strings.Contains(innerQuery, "persistK8sSources") {
+			case strings.Contains(innerQuery, "persistK8sSources"):
 				inner = innerPersistResponse
-			} else {
+			default:
 				inner = `{"type":"","data":{},"request_id":""}`
 			}
 			remoteFetchVal, _ := json.Marshal(inner)
@@ -62,12 +68,18 @@ func startMockOdigosServerForSource(t *testing.T, computePlatformsJSON string) (
 			_, _ = w.Write([]byte(`{"data":{},"errors":[]}`))
 		}
 	}))
-	hostname := strings.TrimPrefix(server.URL, "http://")
+	hostname := strings.TrimPrefix(server.URL, "https://")
 	return server, hostname
 }
 
-// onePlatformForSource is a single compute platform so getClusterID("TestCluster") returns "cluster-1".
-const onePlatformForSource = `[{"id":"cluster-1","name":"TestCluster","odigosVersion":"1.0","type":"kubernetes","status":"connected","connectedAt":0,"lastSeenAt":0,"users":[],"teams":[],"__typename":"ComputePlatform"}]`
+// onePlatformForSource is a single supported (>= v1.20) compute platform so
+// ProxyByName("TestCluster") returns a *ProxyClient bound to "cluster-1".
+const onePlatformForSource = `[{"id":"cluster-1","name":"TestCluster","odigosVersion":"v1.22.0","type":"k8s","status":"connected","connectedAt":0,"lastSeenAt":0,"users":[],"teams":[],"__typename":"ComputePlatform"}]`
+
+// onePlatformForSourceTooOld represents a single cluster running an
+// unsupported (pre-min) Odigos version. The provider should soft-fail with a
+// per-cluster warning and skip the resource.
+const onePlatformForSourceTooOld = `[{"id":"cluster-1","name":"TestCluster","odigosVersion":"v1.18.0","type":"k8s","status":"connected","connectedAt":0,"lastSeenAt":0,"users":[],"teams":[],"__typename":"ComputePlatform"}]`
 
 func TestAccOdigosSourceResource_CreateReadDelete(t *testing.T) {
 	server, hostname := startMockOdigosServerForSource(t, onePlatformForSource)
@@ -79,15 +91,15 @@ func TestAccOdigosSourceResource_CreateReadDelete(t *testing.T) {
 			{
 				Config: testAccOdigosSourceResourceConfig(hostname, "TestCluster", "my-deploy", "Deployment", "default", "default"),
 				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr("odigos_source.example", "cluster_name", "TestCluster"),
-					resource.TestCheckResourceAttr("odigos_source.example", "cluster_id", "cluster-1"),
-					resource.TestCheckResourceAttr("odigos_source.example", "name", "my-deploy"),
-					resource.TestCheckResourceAttr("odigos_source.example", "kind", "Deployment"),
-					resource.TestCheckResourceAttr("odigos_source.example", "namespace", "default"),
-					resource.TestCheckResourceAttr("odigos_source.example", "current_stream_name", "default"),
-					resource.TestCheckResourceAttr("odigos_source.example", "otel_service_name", "my-deploy-default"),
-					resource.TestCheckResourceAttr("odigos_source.example", "data_stream_names.#", "1"),
-					resource.TestCheckResourceAttr("odigos_source.example", "data_stream_names.0", "default"),
+					resource.TestCheckResourceAttr("odigos-central_source.example", "cluster_name", "TestCluster"),
+					resource.TestCheckResourceAttr("odigos-central_source.example", "cluster_id", "cluster-1"),
+					resource.TestCheckResourceAttr("odigos-central_source.example", "name", "my-deploy"),
+					resource.TestCheckResourceAttr("odigos-central_source.example", "kind", "Deployment"),
+					resource.TestCheckResourceAttr("odigos-central_source.example", "namespace", "default"),
+					resource.TestCheckResourceAttr("odigos-central_source.example", "current_stream_name", "default"),
+					resource.TestCheckResourceAttr("odigos-central_source.example", "otel_service_name", "my-deploy-default"),
+					resource.TestCheckResourceAttr("odigos-central_source.example", "data_stream_names.#", "1"),
+					resource.TestCheckResourceAttr("odigos-central_source.example", "data_stream_names.0", "default"),
 				),
 			},
 		},
@@ -95,7 +107,6 @@ func TestAccOdigosSourceResource_CreateReadDelete(t *testing.T) {
 }
 
 func TestAccOdigosSourceResource_ClusterNotFound(t *testing.T) {
-	// No platforms so getClusterID("TestCluster") will fail.
 	server, hostname := startMockOdigosServerForSource(t, "[]")
 	defer server.Close()
 
@@ -104,21 +115,39 @@ func TestAccOdigosSourceResource_ClusterNotFound(t *testing.T) {
 		Steps: []resource.TestStep{
 			{
 				Config:      testAccOdigosSourceResourceConfig(hostname, "TestCluster", "my-deploy", "Deployment", "default", "default"),
-				ExpectError: mustRegex("cluster.*not found|Error getting cluster ID"),
+				ExpectError: mustRegex("not found|Error Resolving Cluster"),
+			},
+		},
+	})
+}
+
+// TestAccOdigosSourceResource_UnsupportedClusterIsSoftFail verifies that a
+// cluster running an unsupported Odigos version does not crash the apply but
+// surfaces a warning and a clear error explaining nothing was created.
+func TestAccOdigosSourceResource_UnsupportedClusterIsSoftFail(t *testing.T) {
+	server, hostname := startMockOdigosServerForSource(t, onePlatformForSourceTooOld)
+	defer server.Close()
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccOdigosSourceResourceConfig(hostname, "TestCluster", "my-deploy", "Deployment", "default", "default"),
+				ExpectError: mustRegex("Cannot Create Source on Unsupported Cluster|not supported"),
 			},
 		},
 	})
 }
 
 func testAccOdigosSourceResourceConfig(hostname, clusterName, name, kind, namespace, currentStreamName string) string {
-	return `provider "odigos" {
+	return `provider "odigos-central" {
   hostname = "` + hostname + `"
   username = "testuser"
   password = "testpass"
-  insecure = true
+  insecure_skip_verify = true
 }
 
-resource "odigos_source" "example" {
+resource "odigos-central_source" "example" {
   cluster_name       = "` + clusterName + `"
   name               = "` + name + `"
   kind               = "` + kind + `"

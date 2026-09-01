@@ -1,3 +1,6 @@
+// Copyright (c) Odigos
+// SPDX-License-Identifier: Apache-2.0
+
 package logger
 
 import (
@@ -20,7 +23,7 @@ func (l *TfLogAdapter) Error(ctx context.Context, msg string, args ...any) {
 	tflog.Error(ctx, msg, argsToMap(args...))
 }
 
-// Helper to convert slog-style args to map[string]interface{}
+// argsToMap converts slog-style variadic key/value args to a map.
 func argsToMap(args ...any) map[string]any {
 	m := make(map[string]any)
 	for i := 0; i < len(args)-1; i += 2 {

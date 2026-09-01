@@ -1,52 +1,97 @@
+// Copyright (c) Odigos
+// SPDX-License-Identifier: Apache-2.0
+
 package provider
 
 import (
 	"context"
+	"errors"
 	"os"
+	"strconv"
 	"sync"
-	"terraform-provider-odigos/pkgs/logger"
+	"terraform-provider-odigos-central/pkgs/logger"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
-	odigosclient "github.com/odigos-io/odigos-central-client"
+
+	"github.com/odigos-io/odigos-central-client/central"
 	odigosLogger "github.com/odigos-io/odigos-central-client/logger"
+	odigostypes "github.com/odigos-io/odigos-central-client/types"
 )
 
 var _ provider.Provider = &odigosProvider{}
 
-// cachedOdigosClient wraps OdigosClient and caches GetComputePlatforms for the duration of the Terraform run using sync.Once.
+// cachedOdigosClient wraps a *central.CentralClient with provider-friendly
+// caching:
+//
+//   - GetComputePlatforms is already cached inside the central client; this
+//     wrapper exposes it transparently so existing call sites keep working.
+//
+//   - ProxyByName is cached per cluster name (sync.Map) so multiple resources
+//     targeting the same cluster don't re-resolve the platform on every call.
+//
+//   - Proxy resolution returns Terraform diag.Diagnostics rather than raw
+//     errors so each resource can decide whether the situation is fatal
+//     (cluster not found, GraphQL error) or a soft warning (proxy version
+//     too old, unsupported platform). Read keeps prior state for that
+//     warning; Create, Update, and Delete error so Terraform does not
+//     pretend the remote object changed.
 type cachedOdigosClient struct {
-	client        *odigosclient.OdigosClient
-	platformsOnce sync.Once
-	platforms     []odigosclient.ComputePlatform
-	platformsErr  error
+	client  *central.CentralClient
+	proxies sync.Map
 }
 
-func (c *cachedOdigosClient) GetComputePlatforms(ctx context.Context) ([]odigosclient.ComputePlatform, error) {
-	c.platformsOnce.Do(func() {
-		c.platforms, c.platformsErr = c.client.GetComputePlatforms(ctx)
-	})
-	return c.platforms, c.platformsErr
+func (c *cachedOdigosClient) GetComputePlatforms(ctx context.Context) ([]odigostypes.ComputePlatform, error) {
+	return c.client.GetComputePlatforms(ctx)
 }
 
-func (c *cachedOdigosClient) GetSource(ctx context.Context, proxyID string, sourceID odigosclient.SourceId) (odigosclient.Source, error) {
-	return c.client.GetSource(ctx, proxyID, sourceID)
-}
+// ProxyByName resolves a cluster name to a *central.ProxyClient. If the
+// cluster doesn't exist, an error diagnostic is returned. If the cluster is
+// unsupported (too old, unknown platform), a *warning* diagnostic is
+// returned and the *ProxyClient is nil. Callers must not treat that as
+// "resource gone": Read should keep prior state; mutating operations should error.
+func (c *cachedOdigosClient) ProxyByName(ctx context.Context, name string) (*central.ProxyClient, diag.Diagnostics) {
+	var diags diag.Diagnostics
 
-func (c *cachedOdigosClient) PersistSources(ctx context.Context, proxyID string, sources []odigosclient.SourceInput) (bool, error) {
-	return c.client.PersistSources(ctx, proxyID, sources)
-}
+	if v, ok := c.proxies.Load(name); ok {
+		// The pointer must be extracted before testing for nil: the negative
+		// answer cached below is a typed nil, which is never == nil once
+		// wrapped in an interface.
+		cachedProxy, _ := v.(*central.ProxyClient)
+		if cachedProxy == nil {
+			diags.AddWarning(
+				"Skipping Unsupported Cluster",
+				"Cluster "+name+" was previously detected as unsupported by this provider; subsequent operations will be skipped for this Terraform run.",
+			)
+			return nil, diags
+		}
+		return cachedProxy, diags
+	}
 
-func (c *cachedOdigosClient) GetNamespace(ctx context.Context, proxyID string, namespaceName string) (odigosclient.K8sActualNamespaceDetail, error) {
-	return c.client.GetNamespace(ctx, proxyID, namespaceName)
-}
+	proxy, err := c.client.ProxyByName(ctx, name)
+	if err == nil {
+		c.proxies.Store(name, proxy)
+		return proxy, diags
+	}
 
-func (c *cachedOdigosClient) PersistNamespaceSources(ctx context.Context, proxyID string, namespaces []odigosclient.NamespaceInput) (bool, error) {
-	return c.client.PersistNamespaceSources(ctx, proxyID, namespaces)
+	if central.IsUnsupported(err) {
+		// Per-proxy soft fail: cache the negative answer so we don't keep
+		// re-resolving and emit only one warning per cluster per run.
+		c.proxies.Store(name, (*central.ProxyClient)(nil))
+		diags.AddWarning(
+			"Cluster Not Supported By Provider",
+			"Skipping cluster "+name+": "+err.Error(),
+		)
+		return nil, diags
+	}
+
+	diags.AddError("Error Resolving Cluster", err.Error())
+	return nil, diags
 }
 
 func New(version string) func() provider.Provider {
@@ -62,19 +107,24 @@ type odigosProvider struct {
 }
 
 type odigosProviderModel struct {
-	Hostname types.String `tfsdk:"hostname"`
-	Username types.String `tfsdk:"username"`
-	Password types.String `tfsdk:"password"`
-	Insecure types.Bool   `tfsdk:"insecure"`
+	Hostname           types.String `tfsdk:"hostname"`
+	Username           types.String `tfsdk:"username"`
+	Password           types.String `tfsdk:"password"`
+	InsecureSkipVerify types.Bool   `tfsdk:"insecure_skip_verify"`
 }
 
 func (p *odigosProvider) Metadata(ctx context.Context, req provider.MetadataRequest, resp *provider.MetadataResponse) {
-	resp.TypeName = "odigos"
+	resp.TypeName = "odigos-central"
 	resp.Version = p.version
 }
 
 func (p *odigosProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
 	resp.Schema = schema.Schema{
+		MarkdownDescription: "Manages Odigos Central: connected clusters, namespace selection, and workload " +
+			"instrumentation. The provider always connects to the Central API over HTTPS. Set `hostname`, " +
+			"`username`, and `password` here or via `ODIGOS_HOSTNAME`, `ODIGOS_USERNAME`, and `ODIGOS_PASSWORD`. " +
+			"`insecure_skip_verify` (or `ODIGOS_INSECURE_SKIP_VERIFY`) disables TLS certificate and hostname " +
+			"verification and should be used only with a self-signed or otherwise untrusted Central certificate.",
 		Attributes: map[string]schema.Attribute{
 			"hostname": schema.StringAttribute{
 				Optional:    true,
@@ -89,9 +139,12 @@ func (p *odigosProvider) Schema(_ context.Context, _ provider.SchemaRequest, res
 				Sensitive:   true,
 				Description: "The Odigos API password. Can also be set via ODIGOS_PASSWORD.",
 			},
-			"insecure": schema.BoolAttribute{
-				Optional:    true,
-				Description: "Whether to skip TLS verification when connecting to the Odigos API.",
+			"insecure_skip_verify": schema.BoolAttribute{
+				Optional: true,
+				Description: "Skip verification of the Odigos API's TLS certificate and hostname. The connection stays " +
+					"encrypted but becomes vulnerable to man-in-the-middle attacks, so enable this only when Central " +
+					"presents a self-signed or otherwise untrusted certificate, such as on a dev or test cluster. " +
+					"Defaults to false. Can also be set via ODIGOS_INSECURE_SKIP_VERIFY.",
 			},
 		},
 	}
@@ -132,12 +185,12 @@ func (p *odigosProvider) Configure(ctx context.Context, req provider.ConfigureRe
 		)
 	}
 
-	if config.Insecure.IsUnknown() {
+	if config.InsecureSkipVerify.IsUnknown() {
 		resp.Diagnostics.AddAttributeError(
-			path.Root("insecure"),
-			"Unknown Odigos API Insecure Setting",
-			"The provider cannot create the Odigos API client as there is an unknown configuration value for the insecure TLS setting. "+
-				"Either target apply the source of the value first or set the value statically in the configuration.",
+			path.Root("insecure_skip_verify"),
+			"Unknown Odigos API TLS Verification Setting",
+			"The provider cannot create the Odigos API client as there is an unknown configuration value for insecure_skip_verify. "+
+				"Either target apply the source of the value first, set the value statically in the configuration, or use the ODIGOS_INSECURE_SKIP_VERIFY environment variable.",
 		)
 	}
 
@@ -152,18 +205,28 @@ func (p *odigosProvider) Configure(ctx context.Context, req provider.ConfigureRe
 	if !config.Hostname.IsNull() {
 		hostname = config.Hostname.ValueString()
 	}
-
 	if !config.Username.IsNull() {
 		username = config.Username.ValueString()
 	}
-
 	if !config.Password.IsNull() {
 		password = config.Password.ValueString()
 	}
 
-	insecure := false
-	if !config.Insecure.IsNull() {
-		insecure = config.Insecure.ValueBool()
+	insecureSkipVerify := false
+	if env := os.Getenv("ODIGOS_INSECURE_SKIP_VERIFY"); env != "" {
+		parsed, err := strconv.ParseBool(env)
+		if err != nil {
+			resp.Diagnostics.AddAttributeError(
+				path.Root("insecure_skip_verify"),
+				"Invalid ODIGOS_INSECURE_SKIP_VERIFY Value",
+				"The ODIGOS_INSECURE_SKIP_VERIFY environment variable must be a boolean such as \"true\" or \"false\", but was "+strconv.Quote(env)+".",
+			)
+		} else {
+			insecureSkipVerify = parsed
+		}
+	}
+	if !config.InsecureSkipVerify.IsNull() {
+		insecureSkipVerify = config.InsecureSkipVerify.ValueBool()
 	}
 
 	if hostname == "" {
@@ -200,19 +263,32 @@ func (p *odigosProvider) Configure(ctx context.Context, req provider.ConfigureRe
 		return
 	}
 
-	clientConfig := odigosclient.ClientConfig{
-		Hostname: hostname,
-		Username: username,
-		Password: password,
-		Insecure: insecure,
+	// ClientConfig.Insecure is deliberately left unset. It downgrades the
+	// connection to plain HTTP, which would put the password on the wire in
+	// cleartext, so the provider always speaks HTTPS to Central.
+	clientConfig := central.ClientConfig{
+		Hostname:           hostname,
+		Username:           username,
+		Password:           password,
+		InsecureSkipVerify: insecureSkipVerify,
 	}
-	logAdapter := logger.TfLogAdapter{}
-	client, err := odigosclient.NewClient(
-		ctx,
-		clientConfig,
-		odigosLogger.WithLogger(&logAdapter))
 
+	logAdapter := logger.TfLogAdapter{}
+	client, err := central.NewClient(ctx, clientConfig, odigosLogger.WithLogger(&logAdapter))
 	if err != nil {
+		// Hard-fail at Configure for *Central* version mismatches: the user
+		// must upgrade Central (or downgrade the provider) before any
+		// resources can be managed.
+		var ucv *central.UnsupportedCentralVersionError
+		if errors.As(err, &ucv) {
+			resp.Diagnostics.AddError(
+				"Odigos Central Version Not Supported",
+				"This provider requires Odigos Central "+ucv.Min.String()+" or newer, but the connected Central server reports "+ucv.Got.String()+". "+
+					"Either upgrade the Central deployment or pin to an older version of the provider.",
+			)
+			return
+		}
+
 		resp.Diagnostics.AddError(
 			"Unable to Create Odigos API Client",
 			"An unexpected error occurred when creating the Odigos API client. "+
@@ -222,8 +298,9 @@ func (p *odigosProvider) Configure(ctx context.Context, req provider.ConfigureRe
 		return
 	}
 
-	resp.DataSourceData = &cachedOdigosClient{client: client}
-	resp.ResourceData = &cachedOdigosClient{client: client}
+	cached := &cachedOdigosClient{client: client}
+	resp.DataSourceData = cached
+	resp.ResourceData = cached
 }
 
 func (p *odigosProvider) Resources(ctx context.Context) []func() resource.Resource {

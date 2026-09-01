@@ -1,1 +1,0 @@
-data "odigos_compute_platforms" "example" {}

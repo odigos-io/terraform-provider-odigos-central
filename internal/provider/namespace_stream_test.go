@@ -164,6 +164,24 @@ func namespaceRawValue(t *testing.T, schema rsschema.Schema, stream string) tfty
 	})
 }
 
+func namespaceRawValueWithSelected(t *testing.T, schema rsschema.Schema, stream string, selected bool) tftypes.Value {
+	t.Helper()
+
+	objType, ok := schema.Type().TerraformType(context.Background()).(tftypes.Object)
+	if !ok {
+		t.Fatal("expected the namespace schema to be an object type")
+	}
+
+	return tftypes.NewValue(objType, map[string]tftypes.Value{
+		"cluster_name":        tftypes.NewValue(tftypes.String, "TestCluster"),
+		"name":                tftypes.NewValue(tftypes.String, "default"),
+		"current_stream_name": tftypes.NewValue(tftypes.String, stream),
+		"selected":            tftypes.NewValue(tftypes.Bool, selected),
+		"data_stream_names":   tftypes.NewValue(objType.AttributeTypes["data_stream_names"], nil),
+		"sources":             tftypes.NewValue(objType.AttributeTypes["sources"], nil),
+	})
+}
+
 // TestNamespaceUpdateAddsNewStreamBeforeRemovingOld pins the ordering that makes a
 // stream move non-destructive. Odigos keeps stream membership as labels on the
 // namespace's Source CRD and deletes the Source once its last stream label goes away,
@@ -267,10 +285,10 @@ func TestNamespaceUpdateKeepsPriorStreamWhenRemovalFails(t *testing.T) {
 	}
 }
 
-// TestNamespaceReadRemovesWhenNotInStream covers out-of-band stream moves. The
-// namespace object still exists in the API; only DataStreamNames shows it left
-// the stream this resource manages, so Read must drop it from state.
-func TestNamespaceReadRemovesWhenNotInStream(t *testing.T) {
+// TestNamespaceReadKeepsWhenNotInStream covers out-of-band stream membership
+// changes. The namespace still exists; selected and data_stream_names are
+// refreshed from the API rather than dropping the resource.
+func TestNamespaceReadKeepsWhenNotInStream(t *testing.T) {
 	server, hostname, _ := startStreamMoveMockServer(t, []string{"beta"})
 	defer server.Close()
 
@@ -285,8 +303,8 @@ func TestNamespaceReadRemovesWhenNotInStream(t *testing.T) {
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("leaving a stream is not an error, got: %v", resp.Diagnostics)
 	}
-	if !resp.State.Raw.IsNull() {
-		t.Error("expected Read to remove the resource from state when the namespace is no longer in the configured stream")
+	if resp.State.Raw.IsNull() {
+		t.Fatal("Read dropped the resource because it is not in the configured stream; that is drift, not deletion")
 	}
 }
 
@@ -486,5 +504,120 @@ func TestNamespaceDeleteErrorsOnUnsupportedCluster(t *testing.T) {
 
 	if !resp.Diagnostics.HasError() {
 		t.Fatal("expected an error when deleting a namespace on an unsupported cluster")
+	}
+}
+
+func TestNamespaceCreatePersistsSelectedFalse(t *testing.T) {
+	server, hostname, calls := startStreamMoveMockServer(t, []string{})
+	defer server.Close()
+
+	r, schema := newNamespaceResourceForTest(t, hostname)
+	resp := &fwresource.CreateResponse{State: tfsdk.State{Schema: schema}}
+	r.Create(context.Background(), fwresource.CreateRequest{
+		Plan: tfsdk.Plan{Schema: schema, Raw: namespaceRawValueWithSelected(t, schema, "default", false)},
+	}, resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error diagnostics: %v", resp.Diagnostics)
+	}
+	got := *calls
+	if len(got) != 1 {
+		t.Fatalf("expected 1 persist call, got %d: %+v", len(got), got)
+	}
+	if got[0].Selected {
+		t.Errorf("persist selected = true, want false")
+	}
+}
+
+func TestNamespaceUpdateTogglesSelected(t *testing.T) {
+	server, hostname, calls := startStreamMoveMockServer(t, []string{})
+	defer server.Close()
+
+	r, schema := newNamespaceResourceForTest(t, hostname)
+	prior := namespaceRawValueWithSelected(t, schema, "default", true)
+	resp := &fwresource.UpdateResponse{State: tfsdk.State{Schema: schema, Raw: prior}}
+	r.Update(context.Background(), fwresource.UpdateRequest{
+		Plan:  tfsdk.Plan{Schema: schema, Raw: namespaceRawValueWithSelected(t, schema, "default", false)},
+		State: tfsdk.State{Schema: schema, Raw: prior},
+	}, resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error diagnostics: %v", resp.Diagnostics)
+	}
+	got := *calls
+	if len(got) != 1 {
+		t.Fatalf("expected 1 persist call to disable, got %d: %+v", len(got), got)
+	}
+	if got[0].Stream != "default" || got[0].Selected {
+		t.Errorf("persist = %+v, want stream=default selected=false", got[0])
+	}
+}
+
+func namespaceRawValueWithDataStreams(t *testing.T, schema rsschema.Schema, current string, streams []string) tftypes.Value {
+	t.Helper()
+
+	objType, ok := schema.Type().TerraformType(context.Background()).(tftypes.Object)
+	if !ok {
+		t.Fatal("expected the namespace schema to be an object type")
+	}
+
+	elems := make([]tftypes.Value, len(streams))
+	for i, s := range streams {
+		elems[i] = tftypes.NewValue(tftypes.String, s)
+	}
+
+	return tftypes.NewValue(objType, map[string]tftypes.Value{
+		"cluster_name":        tftypes.NewValue(tftypes.String, "TestCluster"),
+		"name":                tftypes.NewValue(tftypes.String, "default"),
+		"current_stream_name": tftypes.NewValue(tftypes.String, current),
+		"selected":            tftypes.NewValue(tftypes.Bool, true),
+		"data_stream_names":   tftypes.NewValue(objType.AttributeTypes["data_stream_names"], elems),
+		"sources":             tftypes.NewValue(objType.AttributeTypes["sources"], nil),
+	})
+}
+
+func TestNamespaceDeleteRemovesOnlyOwnedStream(t *testing.T) {
+	server, hostname, calls := startStreamMoveMockServer(t, []string{"alpha", "beta"})
+	defer server.Close()
+
+	r, schema := newNamespaceResourceForTest(t, hostname)
+	prior := namespaceRawValueWithDataStreams(t, schema, "alpha", []string{"alpha", "beta"})
+	resp := &fwresource.DeleteResponse{}
+	r.Delete(context.Background(), fwresource.DeleteRequest{
+		State: tfsdk.State{Schema: schema, Raw: prior},
+	}, resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error diagnostics: %v", resp.Diagnostics)
+	}
+	got := *calls
+	if len(got) != 1 {
+		t.Fatalf("expected persist of the owned stream only, got %d: %+v", len(got), got)
+	}
+	if got[0].Stream != "alpha" || got[0].Selected {
+		t.Errorf("persist = %+v, want stream=alpha selected=false", got[0])
+	}
+}
+
+func TestNamespaceDeleteFallsBackToCurrentStream(t *testing.T) {
+	server, hostname, calls := startStreamMoveMockServer(t, []string{})
+	defer server.Close()
+
+	r, schema := newNamespaceResourceForTest(t, hostname)
+	prior := namespaceRawValue(t, schema, "default")
+	resp := &fwresource.DeleteResponse{}
+	r.Delete(context.Background(), fwresource.DeleteRequest{
+		State: tfsdk.State{Schema: schema, Raw: prior},
+	}, resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error diagnostics: %v", resp.Diagnostics)
+	}
+	got := *calls
+	if len(got) != 1 {
+		t.Fatalf("expected 1 persist call, got %d: %+v", len(got), got)
+	}
+	if got[0].Stream != "default" || got[0].Selected {
+		t.Errorf("persist = %+v, want stream=default selected=false", got[0])
 	}
 }

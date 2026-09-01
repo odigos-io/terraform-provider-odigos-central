@@ -4,4 +4,5 @@ resource "odigos-central_source" "example" {
   kind                = "Deployment"
   namespace           = "my-namespace"
   current_stream_name = "default"
+  selected            = true
 }

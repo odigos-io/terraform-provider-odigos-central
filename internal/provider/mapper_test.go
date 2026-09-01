@@ -51,6 +51,7 @@ func TestMapSourceToModelMapsContainersAndConditions(t *testing.T) {
 		Namespace:       "default",
 		Kind:            "Deployment",
 		OtelServiceName: "my-deploy-default",
+		Selected:        true,
 		DataStreamNames: []string{"default"},
 		Containers: []odigostypes.SourceContainer{{
 			ContainerName:          "app",
@@ -76,6 +77,9 @@ func TestMapSourceToModelMapsContainersAndConditions(t *testing.T) {
 	}
 	if model.OtelServiceName.ValueString() != "my-deploy-default" {
 		t.Errorf("otel_service_name = %q", model.OtelServiceName.ValueString())
+	}
+	if !model.Selected.ValueBool() {
+		t.Error("selected = false, want true")
 	}
 	if got := len(model.Containers.Elements()); got != 1 {
 		t.Fatalf("containers.# = %d, want 1", got)

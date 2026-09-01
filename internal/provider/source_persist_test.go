@@ -56,6 +56,7 @@ func sourceRawValue(t *testing.T, schema rsschema.Schema) tftypes.Value {
 		"kind":                tftypes.NewValue(tftypes.String, "Deployment"),
 		"namespace":           tftypes.NewValue(tftypes.String, "default"),
 		"current_stream_name": tftypes.NewValue(tftypes.String, "default"),
+		"selected":            tftypes.NewValue(tftypes.Bool, true),
 		"data_stream_names":   tftypes.NewValue(objType.AttributeTypes["data_stream_names"], nil),
 		"otel_service_name":   tftypes.NewValue(tftypes.String, nil),
 		"cluster_id":          tftypes.NewValue(tftypes.String, nil),
@@ -78,6 +79,7 @@ func sourceRawValueWithClusterID(t *testing.T, schema rsschema.Schema, clusterID
 		"kind":                tftypes.NewValue(tftypes.String, "Deployment"),
 		"namespace":           tftypes.NewValue(tftypes.String, "default"),
 		"current_stream_name": tftypes.NewValue(tftypes.String, "default"),
+		"selected":            tftypes.NewValue(tftypes.Bool, true),
 		"data_stream_names":   tftypes.NewValue(objType.AttributeTypes["data_stream_names"], nil),
 		"otel_service_name":   tftypes.NewValue(tftypes.String, nil),
 		"cluster_id":          tftypes.NewValue(tftypes.String, clusterID),
@@ -263,6 +265,30 @@ func sourceRawValueWithStream(t *testing.T, schema rsschema.Schema, stream strin
 		"kind":                tftypes.NewValue(tftypes.String, "Deployment"),
 		"namespace":           tftypes.NewValue(tftypes.String, "default"),
 		"current_stream_name": tftypes.NewValue(tftypes.String, stream),
+		"selected":            tftypes.NewValue(tftypes.Bool, true),
+		"data_stream_names":   tftypes.NewValue(objType.AttributeTypes["data_stream_names"], nil),
+		"otel_service_name":   tftypes.NewValue(tftypes.String, nil),
+		"cluster_id":          tftypes.NewValue(tftypes.String, "cluster-1"),
+		"containers":          tftypes.NewValue(objType.AttributeTypes["containers"], nil),
+		"conditions":          tftypes.NewValue(objType.AttributeTypes["conditions"], nil),
+	})
+}
+
+func sourceRawValueWithSelected(t *testing.T, schema rsschema.Schema, selected bool) tftypes.Value {
+	t.Helper()
+
+	objType, ok := schema.Type().TerraformType(context.Background()).(tftypes.Object)
+	if !ok {
+		t.Fatal("expected the source schema to be an object type")
+	}
+
+	return tftypes.NewValue(objType, map[string]tftypes.Value{
+		"cluster_name":        tftypes.NewValue(tftypes.String, "TestCluster"),
+		"name":                tftypes.NewValue(tftypes.String, "my-deploy"),
+		"kind":                tftypes.NewValue(tftypes.String, "Deployment"),
+		"namespace":           tftypes.NewValue(tftypes.String, "default"),
+		"current_stream_name": tftypes.NewValue(tftypes.String, "default"),
+		"selected":            tftypes.NewValue(tftypes.Bool, selected),
 		"data_stream_names":   tftypes.NewValue(objType.AttributeTypes["data_stream_names"], nil),
 		"otel_service_name":   tftypes.NewValue(tftypes.String, nil),
 		"cluster_id":          tftypes.NewValue(tftypes.String, "cluster-1"),
@@ -379,7 +405,7 @@ func startSourceStreamMoveMock(t *testing.T, sourceStreams []string) (*httptest.
 	return server, strings.TrimPrefix(server.URL, "https://"), &calls
 }
 
-func TestSourceReadRemovesWhenUnselected(t *testing.T) {
+func TestSourceReadRefreshesSelectedWhenUnselected(t *testing.T) {
 	server, hostname := startSourceGetMock(t, false, []string{"default"})
 	defer server.Close()
 
@@ -393,12 +419,17 @@ func TestSourceReadRemovesWhenUnselected(t *testing.T) {
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("deselection is not an error, got: %v", resp.Diagnostics)
 	}
-	if !resp.State.Raw.IsNull() {
-		t.Error("expected Read to remove the resource from state when the source is no longer selected")
+	if resp.State.Raw.IsNull() {
+		t.Fatal("Read dropped the resource because selected is false; selected is configuration, not identity")
+	}
+	var stored SourceResourceModel
+	resp.Diagnostics.Append(resp.State.Get(context.Background(), &stored)...)
+	if stored.Selected.ValueBool() {
+		t.Error("selected = true, want false from the API")
 	}
 }
 
-func TestSourceReadRemovesWhenNotInStream(t *testing.T) {
+func TestSourceReadKeepsWhenNotInStream(t *testing.T) {
 	server, hostname := startSourceGetMock(t, true, []string{"beta"})
 	defer server.Close()
 
@@ -412,8 +443,8 @@ func TestSourceReadRemovesWhenNotInStream(t *testing.T) {
 	if resp.Diagnostics.HasError() {
 		t.Fatalf("leaving a stream is not an error, got: %v", resp.Diagnostics)
 	}
-	if !resp.State.Raw.IsNull() {
-		t.Error("expected Read to remove the resource from state when the source is no longer in the configured stream")
+	if resp.State.Raw.IsNull() {
+		t.Fatal("Read dropped the resource because it is not in the configured stream; that is drift, not deletion")
 	}
 }
 
@@ -559,5 +590,125 @@ func TestSourceUpdateKeepsPriorStreamWhenRemovalFails(t *testing.T) {
 	resp.Diagnostics.Append(resp.State.Get(context.Background(), &stored)...)
 	if got := stored.CurrentStreamName.ValueString(); got != "alpha" {
 		t.Errorf("current_stream_name = %q, want the prior value %q so the next plan retries the move", got, "alpha")
+	}
+}
+
+func TestSourceCreatePersistsSelectedFalse(t *testing.T) {
+	server, hostname, calls := startSourceStreamMoveMock(t, []string{})
+	defer server.Close()
+
+	r, schema := newSourceResourceForTest(t, hostname)
+	resp := &fwresource.CreateResponse{State: tfsdk.State{Schema: schema}}
+	r.Create(context.Background(), fwresource.CreateRequest{
+		Plan: tfsdk.Plan{Schema: schema, Raw: sourceRawValueWithSelected(t, schema, false)},
+	}, resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error diagnostics: %v", resp.Diagnostics)
+	}
+	got := *calls
+	if len(got) != 1 {
+		t.Fatalf("expected 1 persist call, got %d: %+v", len(got), got)
+	}
+	if got[0].Selected {
+		t.Errorf("persist selected = true, want false")
+	}
+}
+
+func TestSourceUpdateTogglesSelected(t *testing.T) {
+	server, hostname, calls := startSourceStreamMoveMock(t, []string{})
+	defer server.Close()
+
+	r, schema := newSourceResourceForTest(t, hostname)
+	prior := sourceRawValueWithSelected(t, schema, true)
+	resp := &fwresource.UpdateResponse{State: tfsdk.State{Schema: schema, Raw: prior}}
+	r.Update(context.Background(), fwresource.UpdateRequest{
+		Plan:  tfsdk.Plan{Schema: schema, Raw: sourceRawValueWithSelected(t, schema, false)},
+		State: tfsdk.State{Schema: schema, Raw: prior},
+	}, resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error diagnostics: %v", resp.Diagnostics)
+	}
+	got := *calls
+	if len(got) != 1 {
+		t.Fatalf("expected 1 persist call to disable, got %d: %+v", len(got), got)
+	}
+	if got[0].Stream != "default" || got[0].Selected {
+		t.Errorf("persist = %+v, want stream=default selected=false", got[0])
+	}
+}
+
+func sourceRawValueWithDataStreams(t *testing.T, schema rsschema.Schema, current string, streams []string) tftypes.Value {
+	t.Helper()
+
+	objType, ok := schema.Type().TerraformType(context.Background()).(tftypes.Object)
+	if !ok {
+		t.Fatal("expected the source schema to be an object type")
+	}
+
+	elems := make([]tftypes.Value, len(streams))
+	for i, s := range streams {
+		elems[i] = tftypes.NewValue(tftypes.String, s)
+	}
+
+	return tftypes.NewValue(objType, map[string]tftypes.Value{
+		"cluster_name":        tftypes.NewValue(tftypes.String, "TestCluster"),
+		"name":                tftypes.NewValue(tftypes.String, "my-deploy"),
+		"kind":                tftypes.NewValue(tftypes.String, "Deployment"),
+		"namespace":           tftypes.NewValue(tftypes.String, "default"),
+		"current_stream_name": tftypes.NewValue(tftypes.String, current),
+		"selected":            tftypes.NewValue(tftypes.Bool, true),
+		"data_stream_names":   tftypes.NewValue(objType.AttributeTypes["data_stream_names"], elems),
+		"otel_service_name":   tftypes.NewValue(tftypes.String, nil),
+		"cluster_id":          tftypes.NewValue(tftypes.String, "cluster-1"),
+		"containers":          tftypes.NewValue(objType.AttributeTypes["containers"], nil),
+		"conditions":          tftypes.NewValue(objType.AttributeTypes["conditions"], nil),
+	})
+}
+
+func TestSourceDeleteRemovesOnlyOwnedStream(t *testing.T) {
+	server, hostname, calls := startSourceStreamMoveMock(t, []string{"alpha", "beta"})
+	defer server.Close()
+
+	r, schema := newSourceResourceForTest(t, hostname)
+	prior := sourceRawValueWithDataStreams(t, schema, "alpha", []string{"alpha", "beta"})
+	resp := &fwresource.DeleteResponse{}
+	r.Delete(context.Background(), fwresource.DeleteRequest{
+		State: tfsdk.State{Schema: schema, Raw: prior},
+	}, resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error diagnostics: %v", resp.Diagnostics)
+	}
+	got := *calls
+	if len(got) != 1 {
+		t.Fatalf("expected persist of the owned stream only, got %d: %+v", len(got), got)
+	}
+	if got[0].Stream != "alpha" || got[0].Selected {
+		t.Errorf("persist = %+v, want stream=alpha selected=false", got[0])
+	}
+}
+
+func TestSourceDeleteFallsBackToCurrentStream(t *testing.T) {
+	server, hostname, calls := startSourceStreamMoveMock(t, []string{})
+	defer server.Close()
+
+	r, schema := newSourceResourceForTest(t, hostname)
+	prior := sourceRawValue(t, schema)
+	resp := &fwresource.DeleteResponse{}
+	r.Delete(context.Background(), fwresource.DeleteRequest{
+		State: tfsdk.State{Schema: schema, Raw: prior},
+	}, resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("unexpected error diagnostics: %v", resp.Diagnostics)
+	}
+	got := *calls
+	if len(got) != 1 {
+		t.Fatalf("expected 1 persist call, got %d: %+v", len(got), got)
+	}
+	if got[0].Stream != "default" || got[0].Selected {
+		t.Errorf("persist = %+v, want stream=default selected=false", got[0])
 	}
 }

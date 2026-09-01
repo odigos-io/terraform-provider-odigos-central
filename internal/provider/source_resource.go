@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -69,6 +70,7 @@ type SourceResourceModel struct {
 	Namespace         types.String `tfsdk:"namespace"`
 	Name              types.String `tfsdk:"name"`
 	Kind              types.String `tfsdk:"kind"`
+	Selected          types.Bool   `tfsdk:"selected"`
 	DataStreamNames   types.List   `tfsdk:"data_stream_names"`
 	OtelServiceName   types.String `tfsdk:"otel_service_name"`
 	ClusterID         types.String `tfsdk:"cluster_id"`
@@ -82,10 +84,12 @@ func (r *sourceResource) Metadata(_ context.Context, req resource.MetadataReques
 
 func (r *sourceResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Selects a Kubernetes workload (Deployment, StatefulSet, DaemonSet, and so on) " +
-			"for Odigos instrumentation on one data stream. Changing `cluster_name`, `name`, `kind`, or " +
-			"`namespace` forces replacement. Changing `current_stream_name` moves the source between streams " +
-			"without deselecting it.",
+		MarkdownDescription: "Enables or disables Odigos instrumentation for a Kubernetes workload " +
+			"(Deployment, StatefulSet, DaemonSet, and so on) on one data stream. Set `selected` to false " +
+			"to disable without destroying the resource. Destroying the resource removes it from " +
+			"`current_stream_name` only; other streams in `data_stream_names` (for example membership " +
+			"added outside this resource) are left unchanged. Changing `cluster_name`, `name`, `kind`, " +
+			"or `namespace` forces replacement. Changing `current_stream_name` moves the source between streams.",
 		Attributes: map[string]schema.Attribute{
 			"cluster_name": schema.StringAttribute{
 				Required:    true,
@@ -118,6 +122,12 @@ func (r *sourceResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			"current_stream_name": schema.StringAttribute{
 				Required:    true,
 				Description: "The name of the data stream to use when persisting source selection.",
+			},
+			"selected": schema.BoolAttribute{
+				Optional:    true,
+				Computed:    true,
+				Default:     booldefault.StaticBool(true),
+				Description: "Whether the source is selected for instrumentation. Set to false to disable. Defaults to true.",
 			},
 			"data_stream_names": schema.ListAttribute{
 				Computed:    true,
@@ -230,7 +240,9 @@ func (r *sourceResource) ModifyPlan(ctx context.Context, req resource.ModifyPlan
 		return
 	}
 
-	if plan.CurrentStreamName.Equal(state.CurrentStreamName) {
+	streamChanged := !plan.CurrentStreamName.Equal(state.CurrentStreamName)
+	selectedChanged := !plan.Selected.Equal(state.Selected)
+	if !streamChanged && !selectedChanged {
 		return
 	}
 
@@ -245,7 +257,14 @@ func (r *sourceResource) ModifyPlan(ctx context.Context, req resource.ModifyPlan
 // persistSource writes one source-selection update. The mutation reports failure
 // through a success flag rather than an error, so both are folded into the returned error.
 func persistSource(ctx context.Context, proxy *central.ProxyClient, input odigostypes.SourceInput) error {
-	success, err := proxy.PersistSources(ctx, []odigostypes.SourceInput{input})
+	return persistSources(ctx, proxy, []odigostypes.SourceInput{input})
+}
+
+func persistSources(ctx context.Context, proxy *central.ProxyClient, inputs []odigostypes.SourceInput) error {
+	if len(inputs) == 0 {
+		return nil
+	}
+	success, err := proxy.PersistSources(ctx, inputs)
 	if err != nil {
 		return err
 	}
@@ -281,7 +300,7 @@ func (r *sourceResource) Create(ctx context.Context, req resource.CreateRequest,
 		Namespace:         plan.Namespace.ValueString(),
 		Kind:              plan.Kind.ValueString(),
 		CurrentStreamName: plan.CurrentStreamName.ValueString(),
-		Selected:          true,
+		Selected:          plan.Selected.ValueBool(),
 	}); err != nil {
 		resp.Diagnostics.AddError(
 			"Error persisting source",
@@ -358,20 +377,6 @@ func (r *sourceResource) Read(ctx context.Context, req resource.ReadRequest, res
 		return
 	}
 
-	// This resource manages selection on one data stream. The workload object
-	// remains in the API after it is deselected or moved off that stream.
-	currentStream := state.CurrentStreamName.ValueString()
-	if !source.Selected || (currentStream != "" && !slices.Contains(source.DataStreamNames, currentStream)) {
-		resp.Diagnostics.AddWarning(
-			"Source No Longer Selected",
-			"Source "+state.Kind.ValueString()+"/"+state.Name.ValueString()+" in namespace "+
-				state.Namespace.ValueString()+" is no longer selected on data stream "+currentStream+
-				". It will be removed from the Terraform state.",
-		)
-		resp.State.RemoveResource(ctx)
-		return
-	}
-
 	// cluster_id is Central's identifier for the compute platform. Re-registering
 	// a cluster assigns a new ID without deleting the workload, so a mismatch
 	// here is not "source gone". Refresh cluster_id from the current proxy and
@@ -419,6 +424,7 @@ func (r *sourceResource) Update(ctx context.Context, req resource.UpdateRequest,
 
 	oldStream := state.CurrentStreamName.ValueString()
 	newStream := plan.CurrentStreamName.ValueString()
+	selected := plan.Selected.ValueBool()
 	input := odigostypes.SourceInput{
 		Name:      plan.Name.ValueString(),
 		Namespace: plan.Namespace.ValueString(),
@@ -427,7 +433,7 @@ func (r *sourceResource) Update(ctx context.Context, req resource.UpdateRequest,
 
 	if oldStream != newStream {
 		input.CurrentStreamName = newStream
-		input.Selected = true
+		input.Selected = selected
 		if err := persistSource(ctx, proxy, input); err != nil {
 			resp.Diagnostics.AddError(
 				"Error Adding Source To Data Stream",
@@ -447,6 +453,16 @@ func (r *sourceResource) Update(ctx context.Context, req resource.UpdateRequest,
 			)
 			return
 		}
+	} else if !plan.Selected.Equal(state.Selected) {
+		input.CurrentStreamName = newStream
+		input.Selected = selected
+		if err := persistSource(ctx, proxy, input); err != nil {
+			resp.Diagnostics.AddError(
+				"Error Updating Source Selection",
+				"Could not set selected="+fmt.Sprint(selected)+" on source: "+err.Error(),
+			)
+			return
+		}
 	}
 
 	source, err := proxy.GetSource(ctx, odigostypes.SourceID{
@@ -460,7 +476,7 @@ func (r *sourceResource) Update(ctx context.Context, req resource.UpdateRequest,
 		return
 	}
 
-	if newStream != "" && !slices.Contains(source.DataStreamNames, newStream) {
+	if selected && newStream != "" && !slices.Contains(source.DataStreamNames, newStream) {
 		resp.Diagnostics.AddError(
 			"Source Missing From Target Data Stream",
 			"Source "+input.Kind+"/"+input.Name+" was persisted into data stream "+newStream+
@@ -507,7 +523,8 @@ func (r *sourceResource) Delete(ctx context.Context, req resource.DeleteRequest,
 	}); err != nil {
 		resp.Diagnostics.AddError(
 			"Error deleting source",
-			"Could not delete source, unexpected error: "+err.Error(),
+			"Could not remove source from data stream "+state.CurrentStreamName.ValueString()+
+				", unexpected error: "+err.Error(),
 		)
 		return
 	}
@@ -534,6 +551,7 @@ func mapSourceToModel(model *SourceResourceModel, clusterID string, source odigo
 
 	model.ClusterID = types.StringValue(clusterID)
 	model.OtelServiceName = types.StringValue(source.OtelServiceName)
+	model.Selected = types.BoolValue(source.Selected)
 
 	elems := make([]attr.Value, len(source.DataStreamNames))
 	for i, s := range source.DataStreamNames {

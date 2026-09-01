@@ -20,6 +20,7 @@ resource "odigos-central_namespace" "example" {
   cluster_name        = "LocalCluster"
   name                = "kv-mall"
   current_stream_name = "default"
+  selected            = true
 }
 
 output "namespace" {

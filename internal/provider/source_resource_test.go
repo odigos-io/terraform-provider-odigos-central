@@ -97,6 +97,7 @@ func TestAccOdigosSourceResource_CreateReadDelete(t *testing.T) {
 					resource.TestCheckResourceAttr("odigos-central_source.example", "kind", "Deployment"),
 					resource.TestCheckResourceAttr("odigos-central_source.example", "namespace", "default"),
 					resource.TestCheckResourceAttr("odigos-central_source.example", "current_stream_name", "default"),
+					resource.TestCheckResourceAttr("odigos-central_source.example", "selected", "true"),
 					resource.TestCheckResourceAttr("odigos-central_source.example", "otel_service_name", "my-deploy-default"),
 					resource.TestCheckResourceAttr("odigos-central_source.example", "data_stream_names.#", "1"),
 					resource.TestCheckResourceAttr("odigos-central_source.example", "data_stream_names.0", "default"),

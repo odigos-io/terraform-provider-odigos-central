@@ -14,6 +14,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -65,9 +66,12 @@ func (r *namespaceResource) Metadata(_ context.Context, req resource.MetadataReq
 
 func (r *namespaceResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		MarkdownDescription: "Selects a Kubernetes namespace for Odigos instrumentation on one data stream. " +
-			"Changing `cluster_name` or `name` forces replacement. Changing `current_stream_name` moves the " +
-			"namespace between streams without deselecting it.",
+		MarkdownDescription: "Enables or disables Odigos instrumentation for a Kubernetes namespace on one " +
+			"data stream. Set `selected` to false to disable without destroying the resource. Destroying " +
+			"the resource removes it from `current_stream_name` only; other streams in `data_stream_names` " +
+			"(for example membership added outside this resource) are left unchanged. Changing " +
+			"`cluster_name` or `name` forces replacement. Changing `current_stream_name` moves the " +
+			"namespace between streams.",
 		Attributes: map[string]schema.Attribute{
 			"cluster_name": schema.StringAttribute{
 				Required:    true,
@@ -88,8 +92,10 @@ func (r *namespaceResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				Description: "The name of the data stream to use when persisting namespace selection.",
 			},
 			"selected": schema.BoolAttribute{
+				Optional:    true,
 				Computed:    true,
-				Description: "Whether the namespace is selected.",
+				Default:     booldefault.StaticBool(true),
+				Description: "Whether the namespace is selected for instrumentation. Set to false to disable. Defaults to true.",
 			},
 			"data_stream_names": schema.ListAttribute{
 				Computed:    true,
@@ -152,13 +158,22 @@ func (r *namespaceResource) Configure(_ context.Context, req resource.ConfigureR
 // stream. The mutation reports failure through a success flag rather than an error, so
 // both are folded into the returned error.
 func persistNamespaceStream(ctx context.Context, proxy *central.ProxyClient, namespace, streamName string, selected bool) error {
-	success, err := proxy.PersistNamespaceSources(ctx, []odigostypes.NamespaceInput{
-		{
+	return persistNamespaceStreams(ctx, proxy, namespace, []string{streamName}, selected)
+}
+
+func persistNamespaceStreams(ctx context.Context, proxy *central.ProxyClient, namespace string, streams []string, selected bool) error {
+	if len(streams) == 0 {
+		return nil
+	}
+	inputs := make([]odigostypes.NamespaceInput, 0, len(streams))
+	for _, stream := range streams {
+		inputs = append(inputs, odigostypes.NamespaceInput{
 			Namespace:         namespace,
-			CurrentStreamName: streamName,
+			CurrentStreamName: stream,
 			Selected:          selected,
-		},
-	})
+		})
+	}
+	success, err := proxy.PersistNamespaceSources(ctx, inputs)
 	if err != nil {
 		return err
 	}
@@ -185,11 +200,12 @@ func (r *namespaceResource) ModifyPlan(ctx context.Context, req resource.ModifyP
 		return
 	}
 
-	if plan.CurrentStreamName.Equal(state.CurrentStreamName) {
+	streamChanged := !plan.CurrentStreamName.Equal(state.CurrentStreamName)
+	selectedChanged := !plan.Selected.Equal(state.Selected)
+	if !streamChanged && !selectedChanged {
 		return
 	}
 
-	plan.Selected = types.BoolUnknown()
 	plan.DataStreamNames = types.ListUnknown(types.StringType)
 	plan.Sources = types.ListUnknown(namespaceSourceObjectType)
 
@@ -217,7 +233,7 @@ func (r *namespaceResource) Create(ctx context.Context, req resource.CreateReque
 		return
 	}
 
-	if err := persistNamespaceStream(ctx, proxy, plan.Name.ValueString(), plan.CurrentStreamName.ValueString(), true); err != nil {
+	if err := persistNamespaceStream(ctx, proxy, plan.Name.ValueString(), plan.CurrentStreamName.ValueString(), plan.Selected.ValueBool()); err != nil {
 		resp.Diagnostics.AddError(
 			"Error persisting namespace sources",
 			"Could not persist namespace sources, unexpected error: "+err.Error(),
@@ -291,20 +307,6 @@ func (r *namespaceResource) Read(ctx context.Context, req resource.ReadRequest, 
 		return
 	}
 
-	// What this resource manages is membership in one data stream, not the namespace
-	// itself: the namespace keeps being reported by the API after it is deselected or
-	// moved to another stream outside Terraform, with only DataStreamNames reflecting it.
-	currentStream := state.CurrentStreamName.ValueString()
-	if currentStream != "" && !slices.Contains(detail.DataStreamNames, currentStream) {
-		resp.Diagnostics.AddWarning(
-			"Namespace No Longer In Data Stream",
-			"Namespace "+detail.Name+" is no longer part of data stream "+currentStream+
-				". It will be removed from the Terraform state.",
-		)
-		resp.State.RemoveResource(ctx)
-		return
-	}
-
 	newState, mapDiags := namespaceDetailToModel(ctx, state.ClusterName, state.CurrentStreamName, detail)
 	resp.Diagnostics.Append(mapDiags...)
 	if resp.Diagnostics.HasError() {
@@ -345,9 +347,10 @@ func (r *namespaceResource) Update(ctx context.Context, req resource.UpdateReque
 	namespace := plan.Name.ValueString()
 	oldStream := state.CurrentStreamName.ValueString()
 	newStream := plan.CurrentStreamName.ValueString()
+	selected := plan.Selected.ValueBool()
 
 	if oldStream != newStream {
-		if err := persistNamespaceStream(ctx, proxy, namespace, newStream, true); err != nil {
+		if err := persistNamespaceStream(ctx, proxy, namespace, newStream, selected); err != nil {
 			resp.Diagnostics.AddError(
 				"Error Adding Namespace To Data Stream",
 				"Could not add namespace "+namespace+" to data stream "+newStream+": "+err.Error(),
@@ -366,6 +369,14 @@ func (r *namespaceResource) Update(ctx context.Context, req resource.UpdateReque
 			)
 			return
 		}
+	} else if !plan.Selected.Equal(state.Selected) {
+		if err := persistNamespaceStream(ctx, proxy, namespace, newStream, selected); err != nil {
+			resp.Diagnostics.AddError(
+				"Error Updating Namespace Selection",
+				"Could not set selected="+fmt.Sprint(selected)+" on namespace "+namespace+": "+err.Error(),
+			)
+			return
+		}
 	}
 
 	detail, err := proxy.GetNamespace(ctx, namespace)
@@ -377,7 +388,7 @@ func (r *namespaceResource) Update(ctx context.Context, req resource.UpdateReque
 		return
 	}
 
-	if newStream != "" && !slices.Contains(detail.DataStreamNames, newStream) {
+	if selected && newStream != "" && !slices.Contains(detail.DataStreamNames, newStream) {
 		resp.Diagnostics.AddError(
 			"Namespace Missing From Target Data Stream",
 			"Namespace "+namespace+" was persisted into data stream "+newStream+
@@ -418,7 +429,8 @@ func (r *namespaceResource) Delete(ctx context.Context, req resource.DeleteReque
 	if err := persistNamespaceStream(ctx, proxy, state.Name.ValueString(), state.CurrentStreamName.ValueString(), false); err != nil {
 		resp.Diagnostics.AddError(
 			"Error deleting namespace selection",
-			"Could not persist namespace sources, unexpected error: "+err.Error(),
+			"Could not remove namespace from data stream "+state.CurrentStreamName.ValueString()+
+				", unexpected error: "+err.Error(),
 		)
 		return
 	}

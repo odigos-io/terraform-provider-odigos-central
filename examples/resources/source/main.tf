@@ -18,6 +18,7 @@ resource "odigos-central_source" "instrument" {
   kind                = "Deployment"
   namespace           = "my-namespace"
   current_stream_name = "default"
+  selected            = true
 }
 
 output "resource_central_backend" {

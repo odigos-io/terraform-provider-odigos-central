@@ -10,7 +10,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	fwresource "github.com/hashicorp/terraform-plugin-framework/resource"
 	rsschema "github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -18,6 +20,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
 	"github.com/odigos-io/odigos-central-client/central"
+	odigostypes "github.com/odigos-io/odigos-central-client/types"
 )
 
 // persistCall records one persistK8sNamespaces mutation seen by the mock server.
@@ -529,6 +532,55 @@ func TestNamespaceCreatePersistsSelectedFalse(t *testing.T) {
 	}
 }
 
+func TestExistingNamespaceConflict(t *testing.T) {
+	if msg := existingNamespaceConflict(odigostypes.K8sActualNamespaceDetail{}, "defaultTwoStream"); msg != "" {
+		t.Errorf("empty detail: got %q, want empty", msg)
+	}
+	if msg := existingNamespaceConflict(odigostypes.K8sActualNamespaceDetail{Name: "default"}, "defaultTwoStream"); msg != "" {
+		t.Errorf("no streams: got %q, want empty", msg)
+	}
+	msg := existingNamespaceConflict(odigostypes.K8sActualNamespaceDetail{
+		Name: "kv-mall-1", DataStreamNames: []string{"default"},
+	}, "defaultTwoStream")
+	if !strings.Contains(msg, "kv-mall-1") || !strings.Contains(msg, "data stream default") {
+		t.Errorf("conflict message = %q", msg)
+	}
+	if strings.Contains(msg, "stream(s)") || strings.Contains(msg, "defaultTwoStream") {
+		t.Errorf("conflict message listed extra streams: %q", msg)
+	}
+	msg = existingNamespaceConflict(odigostypes.K8sActualNamespaceDetail{
+		Name: "kv-mall-1", DataStreamNames: []string{"default", "defaultTwoStream"},
+	}, "defaultTwoStream")
+	if !strings.Contains(msg, "data stream default") || strings.Contains(msg, "defaultTwoStream") {
+		t.Errorf("conflict message should name only the existing stream, got %q", msg)
+	}
+}
+
+func TestNamespaceCreateRejectsExistingStreams(t *testing.T) {
+	server, hostname, calls := startStreamMoveMockServer(t, []string{"default"})
+	defer server.Close()
+
+	r, schema := newNamespaceResourceForTest(t, hostname)
+	resp := &fwresource.CreateResponse{State: tfsdk.State{Schema: schema}}
+	r.Create(context.Background(), fwresource.CreateRequest{
+		Plan: tfsdk.Plan{Schema: schema, Raw: namespaceRawValue(t, schema, "defaultTwoStream")},
+	}, resp)
+
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected an error when the namespace is already selected on another stream")
+	}
+	detail := resp.Diagnostics.Errors()[0].Detail()
+	if !strings.Contains(detail, "already an Odigos source") {
+		t.Errorf("diagnostics = %v", resp.Diagnostics)
+	}
+	if !strings.Contains(detail, "data stream default") || strings.Contains(detail, "defaultTwoStream") || strings.Contains(detail, "stream(s)") {
+		t.Errorf("diagnostics should name only the existing stream, got %v", resp.Diagnostics)
+	}
+	if got := *calls; len(got) != 0 {
+		t.Errorf("persist was called %d times, want 0", len(got))
+	}
+}
+
 func TestNamespaceUpdateTogglesSelected(t *testing.T) {
 	server, hostname, calls := startStreamMoveMockServer(t, []string{})
 	defer server.Close()
@@ -619,5 +671,89 @@ func TestNamespaceDeleteFallsBackToCurrentStream(t *testing.T) {
 	}
 	if got[0].Stream != "default" || got[0].Selected {
 		t.Errorf("persist = %+v, want stream=default selected=false", got[0])
+	}
+}
+
+func TestNamespaceDeleteSerializesSameNamespace(t *testing.T) {
+	var inFlight, max atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		query := strings.TrimSpace(body.Query)
+		switch {
+		case strings.Contains(query, "signIn") || strings.Contains(query, "SignIn"):
+			_, _ = w.Write([]byte(`{"data":{"signIn":{"accessToken":"mock-token","idToken":"","status":"","user":{},"__typename":""}},"errors":[]}`))
+		case strings.Contains(query, "systemConfig") || strings.Contains(query, "GetSystemConfig"):
+			_, _ = w.Write([]byte(`{"data":{"systemConfig":{"isInitialized":true,"version":"v1.22.0"}},"errors":[]}`))
+		case strings.Contains(query, "computePlatforms") || strings.Contains(query, "GetComputePlatforms"):
+			_, _ = w.Write([]byte(`{"data":{"computePlatforms":` + onePlatformForNamespace + `},"errors":[]}`))
+		case strings.Contains(query, "remoteFetch") || strings.Contains(query, "RemoteFetch"):
+			innerQuery, _ := body.Variables["query"].(string)
+			inner := `{"type":"","data":{},"request_id":""}`
+			if strings.Contains(innerQuery, "persistK8sNamespaces") {
+				n := inFlight.Add(1)
+				for {
+					m := max.Load()
+					if n <= m || max.CompareAndSwap(m, n) {
+						break
+					}
+				}
+				time.Sleep(40 * time.Millisecond)
+				inFlight.Add(-1)
+				inner = `{"type":"","data":{"persistK8sNamespaces":true,"errors":[]},"request_id":""}`
+			}
+			encoded, _ := json.Marshal(inner)
+			_, _ = w.Write([]byte(`{"data":{"remoteFetch":` + string(encoded) + `},"errors":[]}`))
+		default:
+			_, _ = w.Write([]byte(`{"data":{},"errors":[]}`))
+		}
+	}))
+	defer server.Close()
+
+	client, err := central.NewClient(context.Background(), central.ClientConfig{
+		Hostname:           strings.TrimPrefix(server.URL, "https://"),
+		Username:           "testuser",
+		Password:           "testpass",
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		t.Fatalf("build central client: %v", err)
+	}
+	cached := &cachedOdigosClient{client: client}
+	r1 := &namespaceResource{client: cached}
+	r2 := &namespaceResource{client: cached}
+
+	schemaResp := &fwresource.SchemaResponse{}
+	r1.Schema(context.Background(), fwresource.SchemaRequest{}, schemaResp)
+	schema := schemaResp.Schema
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		resp := &fwresource.DeleteResponse{}
+		r1.Delete(context.Background(), fwresource.DeleteRequest{
+			State: tfsdk.State{Schema: schema, Raw: namespaceRawValue(t, schema, "alpha")},
+		}, resp)
+		if resp.Diagnostics.HasError() {
+			t.Errorf("alpha delete: %v", resp.Diagnostics)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		resp := &fwresource.DeleteResponse{}
+		r2.Delete(context.Background(), fwresource.DeleteRequest{
+			State: tfsdk.State{Schema: schema, Raw: namespaceRawValue(t, schema, "beta")},
+		}, resp)
+		if resp.Diagnostics.HasError() {
+			t.Errorf("beta delete: %v", resp.Diagnostics)
+		}
+	}()
+	wg.Wait()
+	if max.Load() != 1 {
+		t.Errorf("max concurrent persist = %d, want 1", max.Load())
 	}
 }

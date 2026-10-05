@@ -89,7 +89,10 @@ func (r *sourceResource) Schema(_ context.Context, _ resource.SchemaRequest, res
 			"to disable without destroying the resource. Destroying the resource removes it from " +
 			"`current_stream_name` only; other streams in `data_stream_names` (for example membership " +
 			"added outside this resource) are left unchanged. Changing `cluster_name`, `name`, `kind`, " +
-			"or `namespace` forces replacement. Changing `current_stream_name` moves the source between streams.",
+			"or `namespace` forces replacement. Changing `current_stream_name` moves the source between streams. " +
+			"Odigos allows one source per workload: a second resource for the same Deployment (or other kind) " +
+			"on another stream is rejected. Change `current_stream_name` on the existing resource to move it. " +
+			"Creating or destroying several resources for the same workload runs one at a time.",
 		Attributes: map[string]schema.Attribute{
 			"cluster_name": schema.StringAttribute{
 				Required:    true,
@@ -225,6 +228,15 @@ func (r *sourceResource) Configure(_ context.Context, req resource.ConfigureRequ
 	r.client = client
 }
 
+func (r *sourceResource) lockModel(m SourceResourceModel) func() {
+	return r.client.lockPersist(sourcePersistKey(
+		m.ClusterName.ValueString(),
+		m.Namespace.ValueString(),
+		m.Kind.ValueString(),
+		m.Name.ValueString(),
+	))
+}
+
 // ModifyPlan marks computed attributes unknown when the data stream changes.
 // Terraform proposes the prior values for computed attributes on an in-place update,
 // but moving streams rewrites data_stream_names and may change otel_service_name.
@@ -274,6 +286,15 @@ func persistSources(ctx context.Context, proxy *central.ProxyClient, inputs []od
 	return nil
 }
 
+func existingSourceConflict(source odigostypes.Source, plannedStream string) string {
+	if source.Name == "" || source.Namespace == "" || source.Kind == "" || len(source.DataStreamNames) == 0 {
+		return ""
+	}
+	return source.Kind + "/" + source.Name + " in namespace " + source.Namespace +
+		" is already an Odigos source on data stream " + existingMembershipStream(source.DataStreamNames, plannedStream) +
+		". Odigos allows one source per workload. Use a single odigos-central_source and change current_stream_name to move it, or terraform import the existing source."
+}
+
 func (r *sourceResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan SourceResourceModel
 	diags := req.Plan.Get(ctx, &plan)
@@ -295,6 +316,26 @@ func (r *sourceResource) Create(ctx context.Context, req resource.CreateRequest,
 		return
 	}
 
+	unlock := r.lockModel(plan)
+	defer unlock()
+
+	source, err := proxy.GetSource(ctx, odigostypes.SourceID{
+		Name: plan.Name.ValueString(), Namespace: plan.Namespace.ValueString(), Kind: plan.Kind.ValueString(),
+	})
+	if err != nil && !sourceNotYetCreated(err) {
+		resp.Diagnostics.AddError(
+			"Error reading source before create",
+			"Could not get source, unexpected error: "+err.Error(),
+		)
+		return
+	}
+	if err == nil {
+		if msg := existingSourceConflict(source, plan.CurrentStreamName.ValueString()); msg != "" {
+			resp.Diagnostics.AddError("Source Already Exists", msg)
+			return
+		}
+	}
+
 	if err := persistSource(ctx, proxy, odigostypes.SourceInput{
 		Name:              plan.Name.ValueString(),
 		Namespace:         plan.Namespace.ValueString(),
@@ -304,15 +345,24 @@ func (r *sourceResource) Create(ctx context.Context, req resource.CreateRequest,
 	}); err != nil {
 		resp.Diagnostics.AddError(
 			"Error persisting source",
-			"Could not persist source, unexpected error: "+err.Error(),
+			"Could not persist source, unexpected error: "+annotateDuplicateSourceError(err),
 		)
 		return
 	}
 
-	source, err := proxy.GetSource(ctx, odigostypes.SourceID{
+	source, err = proxy.GetSource(ctx, odigostypes.SourceID{
 		Name: plan.Name.ValueString(), Namespace: plan.Namespace.ValueString(), Kind: plan.Kind.ValueString(),
 	})
 	if err != nil {
+		if sourceNotYetCreated(err) && !plan.Selected.ValueBool() {
+			mapDiags := mapSourceToModel(&plan, proxy.ID(), odigostypes.Source{})
+			resp.Diagnostics.Append(mapDiags...)
+			if resp.Diagnostics.HasError() {
+				return
+			}
+			resp.Diagnostics.Append(resp.State.Set(ctx, plan)...)
+			return
+		}
 		resp.Diagnostics.AddError(
 			"Error reading source after create",
 			"Could not get source, unexpected error: "+err.Error(),
@@ -361,6 +411,15 @@ func (r *sourceResource) Read(ctx context.Context, req resource.ReadRequest, res
 		Name: state.Name.ValueString(), Namespace: state.Namespace.ValueString(), Kind: state.Kind.ValueString(),
 	})
 	if err != nil {
+		if sourceNotYetCreated(err) {
+			mapDiags := mapSourceToModel(&state, proxy.ID(), odigostypes.Source{})
+			resp.Diagnostics.Append(mapDiags...)
+			if resp.Diagnostics.HasError() {
+				return
+			}
+			resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+			return
+		}
 		resp.Diagnostics.AddError(
 			"Error getting source",
 			"Could not get source, unexpected error: "+err.Error(),
@@ -469,6 +528,15 @@ func (r *sourceResource) Update(ctx context.Context, req resource.UpdateRequest,
 		Name: input.Name, Namespace: input.Namespace, Kind: input.Kind,
 	})
 	if err != nil {
+		if sourceNotYetCreated(err) && !selected {
+			mapDiags := mapSourceToModel(&plan, proxy.ID(), odigostypes.Source{})
+			resp.Diagnostics.Append(mapDiags...)
+			if resp.Diagnostics.HasError() {
+				return
+			}
+			resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+			return
+		}
 		resp.Diagnostics.AddError(
 			"Error reading source after update",
 			"Could not get source, unexpected error: "+err.Error(),
@@ -514,6 +582,9 @@ func (r *sourceResource) Delete(ctx context.Context, req resource.DeleteRequest,
 		return
 	}
 
+	unlock := r.lockModel(state)
+	defer unlock()
+
 	if err := persistSource(ctx, proxy, odigostypes.SourceInput{
 		Name:              state.Name.ValueString(),
 		Namespace:         state.Namespace.ValueString(),
@@ -524,7 +595,7 @@ func (r *sourceResource) Delete(ctx context.Context, req resource.DeleteRequest,
 		resp.Diagnostics.AddError(
 			"Error deleting source",
 			"Could not remove source from data stream "+state.CurrentStreamName.ValueString()+
-				", unexpected error: "+err.Error(),
+				", unexpected error: "+annotateDuplicateSourceError(err),
 		)
 		return
 	}

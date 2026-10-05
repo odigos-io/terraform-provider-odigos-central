@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -23,10 +24,14 @@ func startMockOdigosServerForNamespace(t *testing.T, computePlatformsJSON string
 	// query (GET_NAMESPACES_WITH_SOURCES) and selects the namespace by name
 	// client-side, so the payload is the k8sActualNamespaces array.
 	// sources: array of {namespace, kind, name, dataStreamNames, selected, numberOfInstances}
+	innerNamespaceUnselected := `{"type":"","data":{"computePlatform":{"k8sActualNamespaces":[{"name":"default","selected":false,"dataStreamNames":[],"sources":[]}]}},"request_id":""}`
 	innerNamespaceResponse := `{"type":"","data":{"computePlatform":{"k8sActualNamespaces":[{"name":"default","selected":true,"dataStreamNames":["default"],"sources":[{"namespace":"default","kind":"Deployment","name":"my-app","dataStreamNames":["default"],"selected":true,"numberOfInstances":1}]}]}},"request_id":""}`
 
 	// Inner response for PersistNamespaceSources.
 	innerPersistNamespacesResponse := `{"type":"","data":{"persistK8sNamespaces":true,"errors":[]},"request_id":""}`
+
+	var mu sync.Mutex
+	persisted := false
 
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/graphql" || r.Method != http.MethodPost {
@@ -53,8 +58,18 @@ func startMockOdigosServerForNamespace(t *testing.T, computePlatformsJSON string
 			innerQuery, _ := body.Variables["query"].(string)
 			var inner string
 			if strings.Contains(innerQuery, "k8sActualNamespaces") || strings.Contains(innerQuery, "GetNamespace") {
-				inner = innerNamespaceResponse
+				mu.Lock()
+				done := persisted
+				mu.Unlock()
+				if done {
+					inner = innerNamespaceResponse
+				} else {
+					inner = innerNamespaceUnselected
+				}
 			} else if strings.Contains(innerQuery, "persistK8sNamespaces") {
+				mu.Lock()
+				persisted = true
+				mu.Unlock()
 				inner = innerPersistNamespacesResponse
 			} else {
 				inner = `{"type":"","data":{},"request_id":""}`

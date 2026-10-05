@@ -29,7 +29,7 @@ func main() {
 	flag.Parse()
 
 	opts := providerserver.ServeOpts{
-		Address: "registry.terraform.io/odigos/odigos-central",
+		Address: "registry.terraform.io/odigos-io/odigos-central",
 		Debug:   debug,
 	}
 

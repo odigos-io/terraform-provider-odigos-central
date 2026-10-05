@@ -10,7 +10,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	fwresource "github.com/hashicorp/terraform-plugin-framework/resource"
 	rsschema "github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -18,6 +20,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
 	"github.com/odigos-io/odigos-central-client/central"
+	odigostypes "github.com/odigos-io/odigos-central-client/types"
 )
 
 func newSourceResourceForTest(t *testing.T, hostname string) (*sourceResource, rsschema.Schema) {
@@ -108,6 +111,12 @@ func writeRemoteFetch(w http.ResponseWriter, inner string) {
 	_, _ = w.Write([]byte(`{"data":{"remoteFetch":` + string(encoded) + `},"errors":[]}`))
 }
 
+const emptySourceGetInner = `{"type":"","data":{"computePlatform":{"source":{"namespace":"","name":"","kind":"","dataStreamNames":[],"selected":false,"otelServiceName":"","containers":[],"conditions":[]}}},"request_id":""}`
+
+const missingInstrumentationConfigInner = `{"type":"","data":{"errors":[{"message":"failed to get InstrumentationConfig: instrumentationconfigs.odigos.io \"deployment-pricing\" not found"}]},"request_id":""}`
+
+const unexpectedGetSourceErrorInner = `{"type":"","data":{"errors":[{"message":"internal server error"}]},"request_id":""}`
+
 // TestSourceCreateErrorsWhenPersistReturnsFalse covers C5: a success=false
 // mutation must not be recorded as a successful create.
 func TestSourceCreateErrorsWhenPersistReturnsFalse(t *testing.T) {
@@ -178,6 +187,8 @@ func TestSourceDeleteErrorsWhenPersistReturnsFalse(t *testing.T) {
 // TestSourceCreateErrorsWhenReadBackFails covers C6: a failed GetSource after
 // persist must not fabricate empty computed attributes as authoritative state.
 func TestSourceCreateErrorsWhenReadBackFails(t *testing.T) {
+	var persisted bool
+	var mu sync.Mutex
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Query     string         `json:"query"`
@@ -189,11 +200,20 @@ func TestSourceCreateErrorsWhenReadBackFails(t *testing.T) {
 		}
 		innerQuery, _ := body.Variables["query"].(string)
 		if strings.Contains(innerQuery, "persistK8sSources") {
+			mu.Lock()
+			persisted = true
+			mu.Unlock()
 			writeRemoteFetch(w, `{"type":"","data":{"persistK8sSources":true},"request_id":""}`)
 			return
 		}
-		// Force GetSource to fail by returning a null inner payload.
 		if strings.Contains(innerQuery, "source(sourceId") || strings.Contains(innerQuery, "GetSource") {
+			mu.Lock()
+			done := persisted
+			mu.Unlock()
+			if !done {
+				writeRemoteFetch(w, emptySourceGetInner)
+				return
+			}
 			encoded, _ := json.Marshal(`null`)
 			_, _ = w.Write([]byte(`{"data":{"remoteFetch":` + string(encoded) + `},"errors":[]}`))
 			return
@@ -224,7 +244,7 @@ func TestSourceCreateErrorsWhenReadBackFails(t *testing.T) {
 // re-registered with a new Central id. The workload is still there, so Read
 // must keep the resource and refresh cluster_id rather than treating it as gone.
 func TestSourceReadKeepsResourceWhenClusterIDChanges(t *testing.T) {
-	server, hostname := startMockOdigosServerForSource(t, onePlatformForSource)
+	server, hostname := startSourceGetMock(t, true, []string{"default"})
 	defer server.Close()
 
 	r, schema := newSourceResourceForTest(t, hostname)
@@ -429,6 +449,45 @@ func TestSourceReadRefreshesSelectedWhenUnselected(t *testing.T) {
 	}
 }
 
+func TestSourceReadKeepsWhenInstrumentationConfigMissing(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if serveSourceHandshake(w, strings.TrimSpace(body.Query)) {
+			return
+		}
+		innerQuery, _ := body.Variables["query"].(string)
+		if strings.Contains(innerQuery, "source(sourceId") || strings.Contains(innerQuery, "GetSource") {
+			writeRemoteFetch(w, missingInstrumentationConfigInner)
+			return
+		}
+		writeRemoteFetch(w, `{"type":"","data":{},"request_id":""}`)
+	}))
+	defer server.Close()
+
+	r, schema := newSourceResourceForTest(t, strings.TrimPrefix(server.URL, "https://"))
+	prior := sourceRawValue(t, schema)
+	resp := &fwresource.ReadResponse{State: tfsdk.State{Schema: schema, Raw: prior}}
+	r.Read(context.Background(), fwresource.ReadRequest{
+		State: tfsdk.State{Schema: schema, Raw: prior},
+	}, resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("missing InstrumentationConfig after unselect is not an error, got: %v", resp.Diagnostics)
+	}
+	if resp.State.Raw.IsNull() {
+		t.Fatal("Read dropped the resource because the InstrumentationConfig was deleted; selected is configuration, not identity")
+	}
+	var stored SourceResourceModel
+	resp.Diagnostics.Append(resp.State.Get(context.Background(), &stored)...)
+	if stored.Selected.ValueBool() {
+		t.Error("selected = true, want false when GetSource reports a missing InstrumentationConfig")
+	}
+}
+
 func TestSourceReadKeepsWhenNotInStream(t *testing.T) {
 	server, hostname := startSourceGetMock(t, true, []string{"beta"})
 	defer server.Close()
@@ -615,6 +674,137 @@ func TestSourceCreatePersistsSelectedFalse(t *testing.T) {
 	}
 }
 
+func TestExistingSourceConflict(t *testing.T) {
+	if msg := existingSourceConflict(odigostypes.Source{}, "defaultTwoStream"); msg != "" {
+		t.Errorf("empty source: got %q, want empty", msg)
+	}
+	if msg := existingSourceConflict(odigostypes.Source{Name: "ads", Namespace: "ns", Kind: "Deployment"}, "defaultTwoStream"); msg != "" {
+		t.Errorf("no streams: got %q, want empty", msg)
+	}
+	msg := existingSourceConflict(odigostypes.Source{
+		Name: "inventory", Namespace: "kv-mall-1", Kind: "Deployment", DataStreamNames: []string{"default"},
+	}, "defaultTwoStream")
+	if !strings.Contains(msg, "Deployment/inventory") || !strings.Contains(msg, "data stream default") {
+		t.Errorf("conflict message = %q", msg)
+	}
+	if strings.Contains(msg, "stream(s)") || strings.Contains(msg, "defaultTwoStream") {
+		t.Errorf("conflict message listed extra streams: %q", msg)
+	}
+	msg = existingSourceConflict(odigostypes.Source{
+		Name: "inventory", Namespace: "kv-mall-1", Kind: "Deployment",
+		DataStreamNames: []string{"default", "defaultTwoStream"},
+	}, "defaultTwoStream")
+	if !strings.Contains(msg, "data stream default") || strings.Contains(msg, "defaultTwoStream") {
+		t.Errorf("conflict message should name only the existing stream, got %q", msg)
+	}
+}
+
+func TestSourceCreateRejectsExistingStreams(t *testing.T) {
+	server, hostname, calls := startSourceStreamMoveMock(t, []string{"default"})
+	defer server.Close()
+
+	r, schema := newSourceResourceForTest(t, hostname)
+	resp := &fwresource.CreateResponse{State: tfsdk.State{Schema: schema}}
+	r.Create(context.Background(), fwresource.CreateRequest{
+		Plan: tfsdk.Plan{Schema: schema, Raw: sourceRawValueWithStream(t, schema, "defaultTwoStream")},
+	}, resp)
+
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected an error when the workload is already a source on another stream")
+	}
+	detail := resp.Diagnostics.Errors()[0].Detail()
+	if !strings.Contains(detail, "already an Odigos source") {
+		t.Errorf("diagnostics = %v", resp.Diagnostics)
+	}
+	if !strings.Contains(detail, "data stream default") || strings.Contains(detail, "defaultTwoStream") || strings.Contains(detail, "stream(s)") {
+		t.Errorf("diagnostics should name only the existing stream, got %v", resp.Diagnostics)
+	}
+	if got := *calls; len(got) != 0 {
+		t.Errorf("persist was called %d times, want 0", len(got))
+	}
+}
+
+func TestSourceCreateWhenInstrumentationConfigMissing(t *testing.T) {
+	var persistCount atomic.Int32
+	populated := `{"type":"","data":{"computePlatform":{"source":{"namespace":"default","name":"my-deploy","kind":"Deployment","dataStreamNames":["default"],"selected":true,"otelServiceName":"my-deploy","containers":[],"conditions":[]}}},"request_id":""}`
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if serveSourceHandshake(w, strings.TrimSpace(body.Query)) {
+			return
+		}
+		innerQuery, _ := body.Variables["query"].(string)
+		switch {
+		case strings.Contains(innerQuery, "persistK8sSources"):
+			persistCount.Add(1)
+			writeRemoteFetch(w, `{"type":"","data":{"persistK8sSources":true},"request_id":""}`)
+		case strings.Contains(innerQuery, "source(sourceId") || strings.Contains(innerQuery, "GetSource"):
+			if persistCount.Load() == 0 {
+				writeRemoteFetch(w, missingInstrumentationConfigInner)
+				return
+			}
+			writeRemoteFetch(w, populated)
+		default:
+			writeRemoteFetch(w, `{"type":"","data":{},"request_id":""}`)
+		}
+	}))
+	defer server.Close()
+
+	r, schema := newSourceResourceForTest(t, strings.TrimPrefix(server.URL, "https://"))
+	resp := &fwresource.CreateResponse{State: tfsdk.State{Schema: schema}}
+	r.Create(context.Background(), fwresource.CreateRequest{
+		Plan: tfsdk.Plan{Schema: schema, Raw: sourceRawValue(t, schema)},
+	}, resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("Create should persist when GetSource reports a missing InstrumentationConfig, got %v", resp.Diagnostics)
+	}
+	if persistCount.Load() != 1 {
+		t.Errorf("persist called %d times, want 1", persistCount.Load())
+	}
+}
+
+func TestSourceCreateFailsOnUnexpectedGetSourceError(t *testing.T) {
+	var persistCount atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if serveSourceHandshake(w, strings.TrimSpace(body.Query)) {
+			return
+		}
+		innerQuery, _ := body.Variables["query"].(string)
+		switch {
+		case strings.Contains(innerQuery, "persistK8sSources"):
+			persistCount.Add(1)
+			writeRemoteFetch(w, `{"type":"","data":{"persistK8sSources":true},"request_id":""}`)
+		case strings.Contains(innerQuery, "source(sourceId") || strings.Contains(innerQuery, "GetSource"):
+			writeRemoteFetch(w, unexpectedGetSourceErrorInner)
+		default:
+			writeRemoteFetch(w, `{"type":"","data":{},"request_id":""}`)
+		}
+	}))
+	defer server.Close()
+
+	r, schema := newSourceResourceForTest(t, strings.TrimPrefix(server.URL, "https://"))
+	resp := &fwresource.CreateResponse{State: tfsdk.State{Schema: schema}}
+	r.Create(context.Background(), fwresource.CreateRequest{
+		Plan: tfsdk.Plan{Schema: schema, Raw: sourceRawValue(t, schema)},
+	}, resp)
+
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected Create to fail on an unexpected GetSource error")
+	}
+	if persistCount.Load() != 0 {
+		t.Errorf("persist called %d times, want 0", persistCount.Load())
+	}
+}
+
 func TestSourceUpdateTogglesSelected(t *testing.T) {
 	server, hostname, calls := startSourceStreamMoveMock(t, []string{})
 	defer server.Close()
@@ -636,6 +826,86 @@ func TestSourceUpdateTogglesSelected(t *testing.T) {
 	}
 	if got[0].Stream != "default" || got[0].Selected {
 		t.Errorf("persist = %+v, want stream=default selected=false", got[0])
+	}
+}
+
+func TestSourceUpdateUnselectedWhenInstrumentationConfigMissing(t *testing.T) {
+	var persistCount atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if serveSourceHandshake(w, strings.TrimSpace(body.Query)) {
+			return
+		}
+		innerQuery, _ := body.Variables["query"].(string)
+		switch {
+		case strings.Contains(innerQuery, "persistK8sSources"):
+			persistCount.Add(1)
+			writeRemoteFetch(w, `{"type":"","data":{"persistK8sSources":true},"request_id":""}`)
+		case strings.Contains(innerQuery, "source(sourceId") || strings.Contains(innerQuery, "GetSource"):
+			writeRemoteFetch(w, missingInstrumentationConfigInner)
+		default:
+			writeRemoteFetch(w, `{"type":"","data":{},"request_id":""}`)
+		}
+	}))
+	defer server.Close()
+
+	r, schema := newSourceResourceForTest(t, strings.TrimPrefix(server.URL, "https://"))
+	prior := sourceRawValueWithSelected(t, schema, true)
+	resp := &fwresource.UpdateResponse{State: tfsdk.State{Schema: schema, Raw: prior}}
+	r.Update(context.Background(), fwresource.UpdateRequest{
+		Plan:  tfsdk.Plan{Schema: schema, Raw: sourceRawValueWithSelected(t, schema, false)},
+		State: tfsdk.State{Schema: schema, Raw: prior},
+	}, resp)
+
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("Update should keep the resource when GetSource reports a missing InstrumentationConfig after unselect, got %v", resp.Diagnostics)
+	}
+	if persistCount.Load() != 1 {
+		t.Errorf("persist called %d times, want 1", persistCount.Load())
+	}
+	var stored SourceResourceModel
+	resp.Diagnostics.Append(resp.State.Get(context.Background(), &stored)...)
+	if stored.Selected.ValueBool() {
+		t.Error("selected = true, want false after unselect deleted the InstrumentationConfig")
+	}
+}
+
+func TestSourceUpdateSelectedStillFailsOnMissingInstrumentationConfig(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if serveSourceHandshake(w, strings.TrimSpace(body.Query)) {
+			return
+		}
+		innerQuery, _ := body.Variables["query"].(string)
+		switch {
+		case strings.Contains(innerQuery, "persistK8sSources"):
+			writeRemoteFetch(w, `{"type":"","data":{"persistK8sSources":true},"request_id":""}`)
+		case strings.Contains(innerQuery, "source(sourceId") || strings.Contains(innerQuery, "GetSource"):
+			writeRemoteFetch(w, missingInstrumentationConfigInner)
+		default:
+			writeRemoteFetch(w, `{"type":"","data":{},"request_id":""}`)
+		}
+	}))
+	defer server.Close()
+
+	r, schema := newSourceResourceForTest(t, strings.TrimPrefix(server.URL, "https://"))
+	prior := sourceRawValueWithSelected(t, schema, false)
+	resp := &fwresource.UpdateResponse{State: tfsdk.State{Schema: schema, Raw: prior}}
+	r.Update(context.Background(), fwresource.UpdateRequest{
+		Plan:  tfsdk.Plan{Schema: schema, Raw: sourceRawValueWithSelected(t, schema, true)},
+		State: tfsdk.State{Schema: schema, Raw: prior},
+	}, resp)
+
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("expected Update to fail when selected=true but GetSource reports a missing InstrumentationConfig")
 	}
 }
 
@@ -710,5 +980,170 @@ func TestSourceDeleteFallsBackToCurrentStream(t *testing.T) {
 	}
 	if got[0].Stream != "default" || got[0].Selected {
 		t.Errorf("persist = %+v, want stream=default selected=false", got[0])
+	}
+}
+
+func TestSourceDeleteSerializesSameWorkload(t *testing.T) {
+	var inFlight, max atomic.Int32
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if serveSourceHandshake(w, strings.TrimSpace(body.Query)) {
+			return
+		}
+		innerQuery, _ := body.Variables["query"].(string)
+		if strings.Contains(innerQuery, "persistK8sSources") {
+			n := inFlight.Add(1)
+			for {
+				m := max.Load()
+				if n <= m || max.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			time.Sleep(40 * time.Millisecond)
+			inFlight.Add(-1)
+			writeRemoteFetch(w, `{"type":"","data":{"persistK8sSources":true},"request_id":""}`)
+			return
+		}
+		writeRemoteFetch(w, `{"type":"","data":{},"request_id":""}`)
+	}))
+	defer server.Close()
+
+	client, err := central.NewClient(context.Background(), central.ClientConfig{
+		Hostname:           strings.TrimPrefix(server.URL, "https://"),
+		Username:           "testuser",
+		Password:           "testpass",
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		t.Fatalf("build central client: %v", err)
+	}
+	cached := &cachedOdigosClient{client: client}
+	r1 := &sourceResource{client: cached}
+	r2 := &sourceResource{client: cached}
+
+	schemaResp := &fwresource.SchemaResponse{}
+	r1.Schema(context.Background(), fwresource.SchemaRequest{}, schemaResp)
+	schema := schemaResp.Schema
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		resp := &fwresource.DeleteResponse{}
+		r1.Delete(context.Background(), fwresource.DeleteRequest{
+			State: tfsdk.State{Schema: schema, Raw: sourceRawValueWithStream(t, schema, "alpha")},
+		}, resp)
+		if resp.Diagnostics.HasError() {
+			t.Errorf("alpha delete: %v", resp.Diagnostics)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		resp := &fwresource.DeleteResponse{}
+		r2.Delete(context.Background(), fwresource.DeleteRequest{
+			State: tfsdk.State{Schema: schema, Raw: sourceRawValueWithStream(t, schema, "beta")},
+		}, resp)
+		if resp.Diagnostics.HasError() {
+			t.Errorf("beta delete: %v", resp.Diagnostics)
+		}
+	}()
+	wg.Wait()
+	if max.Load() != 1 {
+		t.Errorf("max concurrent persist = %d, want 1", max.Load())
+	}
+}
+
+func TestSourceCreateSerializesSameWorkload(t *testing.T) {
+	var inFlight, max atomic.Int32
+	var persistCount atomic.Int32
+	populated := `{"type":"","data":{"computePlatform":{"source":{"namespace":"default","name":"my-deploy","kind":"Deployment","dataStreamNames":["alpha"],"selected":true,"otelServiceName":"my-deploy","containers":[],"conditions":[]}}},"request_id":""}`
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if serveSourceHandshake(w, strings.TrimSpace(body.Query)) {
+			return
+		}
+		innerQuery, _ := body.Variables["query"].(string)
+		switch {
+		case strings.Contains(innerQuery, "persistK8sSources"):
+			n := inFlight.Add(1)
+			for {
+				m := max.Load()
+				if n <= m || max.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			time.Sleep(40 * time.Millisecond)
+			inFlight.Add(-1)
+			persistCount.Add(1)
+			writeRemoteFetch(w, `{"type":"","data":{"persistK8sSources":true},"request_id":""}`)
+		case strings.Contains(innerQuery, "source(sourceId") || strings.Contains(innerQuery, "GetSource"):
+			if persistCount.Load() == 0 {
+				writeRemoteFetch(w, emptySourceGetInner)
+				return
+			}
+			writeRemoteFetch(w, populated)
+		default:
+			writeRemoteFetch(w, `{"type":"","data":{},"request_id":""}`)
+		}
+	}))
+	defer server.Close()
+
+	client, err := central.NewClient(context.Background(), central.ClientConfig{
+		Hostname:           strings.TrimPrefix(server.URL, "https://"),
+		Username:           "testuser",
+		Password:           "testpass",
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		t.Fatalf("build central client: %v", err)
+	}
+	cached := &cachedOdigosClient{client: client}
+	r1 := &sourceResource{client: cached}
+	r2 := &sourceResource{client: cached}
+
+	schemaResp := &fwresource.SchemaResponse{}
+	r1.Schema(context.Background(), fwresource.SchemaRequest{}, schemaResp)
+	schema := schemaResp.Schema
+
+	var wg sync.WaitGroup
+	var errCount atomic.Int32
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		resp := &fwresource.CreateResponse{State: tfsdk.State{Schema: schema}}
+		r1.Create(context.Background(), fwresource.CreateRequest{
+			Plan: tfsdk.Plan{Schema: schema, Raw: sourceRawValueWithStream(t, schema, "alpha")},
+		}, resp)
+		if resp.Diagnostics.HasError() {
+			errCount.Add(1)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		resp := &fwresource.CreateResponse{State: tfsdk.State{Schema: schema}}
+		r2.Create(context.Background(), fwresource.CreateRequest{
+			Plan: tfsdk.Plan{Schema: schema, Raw: sourceRawValueWithStream(t, schema, "beta")},
+		}, resp)
+		if resp.Diagnostics.HasError() {
+			errCount.Add(1)
+		}
+	}()
+	wg.Wait()
+	if persistCount.Load() != 1 {
+		t.Errorf("persist calls = %d, want 1", persistCount.Load())
+	}
+	if errCount.Load() != 1 {
+		t.Errorf("create errors = %d, want 1 (second resource rejected)", errCount.Load())
+	}
+	if max.Load() != 1 {
+		t.Errorf("max concurrent persist = %d, want 1", max.Load())
 	}
 }

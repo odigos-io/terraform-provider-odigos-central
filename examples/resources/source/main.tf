@@ -1,7 +1,7 @@
 terraform {
   required_providers {
     odigos-central = {
-      source = "registry.terraform.io/odigos/odigos-central"
+      source = "registry.terraform.io/odigos-io/odigos-central"
     }
   }
 }

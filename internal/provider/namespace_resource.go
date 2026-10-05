@@ -71,7 +71,10 @@ func (r *namespaceResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 			"the resource removes it from `current_stream_name` only; other streams in `data_stream_names` " +
 			"(for example membership added outside this resource) are left unchanged. Changing " +
 			"`cluster_name` or `name` forces replacement. Changing `current_stream_name` moves the " +
-			"namespace between streams.",
+			"namespace between streams. Odigos allows one selection per namespace: a second resource " +
+			"for the same namespace on another stream is rejected. Change `current_stream_name` on " +
+			"the existing resource to move it. Creating or destroying several resources for the same " +
+			"namespace runs one at a time.",
 		Attributes: map[string]schema.Attribute{
 			"cluster_name": schema.StringAttribute{
 				Required:    true,
@@ -154,6 +157,13 @@ func (r *namespaceResource) Configure(_ context.Context, req resource.ConfigureR
 	r.client = client
 }
 
+func (r *namespaceResource) lockModel(m NamespaceResourceModel) func() {
+	return r.client.lockPersist(namespacePersistKey(
+		m.ClusterName.ValueString(),
+		m.Name.ValueString(),
+	))
+}
+
 // persistNamespaceStream adds or removes the namespace's membership in a single data
 // stream. The mutation reports failure through a success flag rather than an error, so
 // both are folded into the returned error.
@@ -181,6 +191,15 @@ func persistNamespaceStreams(ctx context.Context, proxy *central.ProxyClient, na
 		return errors.New("the API returned success=false")
 	}
 	return nil
+}
+
+func existingNamespaceConflict(detail odigostypes.K8sActualNamespaceDetail, plannedStream string) string {
+	if detail.Name == "" || len(detail.DataStreamNames) == 0 {
+		return ""
+	}
+	return "Namespace " + detail.Name +
+		" is already an Odigos source on data stream " + existingMembershipStream(detail.DataStreamNames, plannedStream) +
+		". Odigos allows one selection per namespace. Use a single odigos-central_namespace and change current_stream_name to move it, or terraform import the existing namespace."
 }
 
 // ModifyPlan marks the computed attributes unknown when the data stream changes.
@@ -233,15 +252,31 @@ func (r *namespaceResource) Create(ctx context.Context, req resource.CreateReque
 		return
 	}
 
+	unlock := r.lockModel(plan)
+	defer unlock()
+
+	detail, err := proxy.GetNamespace(ctx, plan.Name.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Error reading namespace before create",
+			"Could not get namespace, unexpected error: "+err.Error(),
+		)
+		return
+	}
+	if msg := existingNamespaceConflict(detail, plan.CurrentStreamName.ValueString()); msg != "" {
+		resp.Diagnostics.AddError("Namespace Already Selected", msg)
+		return
+	}
+
 	if err := persistNamespaceStream(ctx, proxy, plan.Name.ValueString(), plan.CurrentStreamName.ValueString(), plan.Selected.ValueBool()); err != nil {
 		resp.Diagnostics.AddError(
 			"Error persisting namespace sources",
-			"Could not persist namespace sources, unexpected error: "+err.Error(),
+			"Could not persist namespace sources, unexpected error: "+annotateDuplicateSourceError(err),
 		)
 		return
 	}
 
-	detail, err := proxy.GetNamespace(ctx, plan.Name.ValueString())
+	detail, err = proxy.GetNamespace(ctx, plan.Name.ValueString())
 	if err != nil {
 		resp.Diagnostics.AddError(
 			"Error reading namespace after create",
@@ -425,6 +460,9 @@ func (r *namespaceResource) Delete(ctx context.Context, req resource.DeleteReque
 		)
 		return
 	}
+
+	unlock := r.lockModel(state)
+	defer unlock()
 
 	if err := persistNamespaceStream(ctx, proxy, state.Name.ValueString(), state.CurrentStreamName.ValueString(), false); err != nil {
 		resp.Diagnostics.AddError(

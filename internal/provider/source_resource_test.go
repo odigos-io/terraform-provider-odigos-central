@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -28,7 +29,11 @@ func startMockOdigosServerForSource(t *testing.T, computePlatformsJSON string) (
 		streams, _ := json.Marshal(dataStreamNames)
 		return `{"type":"","data":{"computePlatform":{"source":{"namespace":"` + namespace + `","name":"` + name + `","kind":"` + kind + `","dataStreamNames":` + string(streams) + `,"selected":true,"otelServiceName":"` + otelServiceName + `","containers":[],"conditions":[]}}},"request_id":""}`
 	}
+	emptySourceResponse := `{"type":"","data":{"computePlatform":{"source":{"namespace":"","name":"","kind":"","dataStreamNames":[],"selected":false,"otelServiceName":"","containers":[],"conditions":[]}}},"request_id":""}`
 	innerPersistResponse := `{"type":"","data":{"persistK8sSources":true},"request_id":""}`
+
+	var mu sync.Mutex
+	persisted := false
 
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/graphql" || r.Method != http.MethodPost {
@@ -56,8 +61,18 @@ func startMockOdigosServerForSource(t *testing.T, computePlatformsJSON string) (
 			var inner string
 			switch {
 			case strings.Contains(innerQuery, "source(sourceId") || strings.Contains(innerQuery, "GetSource"):
-				inner = innerSourceResponse("default", "my-deploy", "Deployment", "my-deploy-default", []string{"default"})
+				mu.Lock()
+				done := persisted
+				mu.Unlock()
+				if done {
+					inner = innerSourceResponse("default", "my-deploy", "Deployment", "my-deploy-default", []string{"default"})
+				} else {
+					inner = emptySourceResponse
+				}
 			case strings.Contains(innerQuery, "persistK8sSources"):
+				mu.Lock()
+				persisted = true
+				mu.Unlock()
 				inner = innerPersistResponse
 			default:
 				inner = `{"type":"","data":{},"request_id":""}`

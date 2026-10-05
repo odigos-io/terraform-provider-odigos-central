@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"terraform-provider-odigos-central/pkgs/logger"
 
@@ -44,6 +45,74 @@ var _ provider.Provider = &odigosProvider{}
 type cachedOdigosClient struct {
 	client  *central.CentralClient
 	proxies sync.Map
+
+	// persistLocks serializes create and destroy of resources that share one
+	// Odigos Source CRD (same cluster + workload, or same cluster + namespace).
+	persistMu    sync.Mutex
+	persistLocks map[string]*sync.Mutex
+}
+
+func sourcePersistKey(cluster, namespace, kind, name string) string {
+	return "source\x00" + cluster + "\x00" + namespace + "\x00" + kind + "\x00" + name
+}
+
+func namespacePersistKey(cluster, name string) string {
+	return "namespace\x00" + cluster + "\x00" + name
+}
+
+// lockPersist returns an unlock function for key. Callers must defer the result.
+// Separate keys run concurrently; the same key waits.
+func (c *cachedOdigosClient) lockPersist(key string) func() {
+	if c == nil {
+		return func() {}
+	}
+	c.persistMu.Lock()
+	if c.persistLocks == nil {
+		c.persistLocks = make(map[string]*sync.Mutex)
+	}
+	m, ok := c.persistLocks[key]
+	if !ok {
+		m = &sync.Mutex{}
+		c.persistLocks[key] = m
+	}
+	c.persistMu.Unlock()
+	m.Lock()
+	return m.Unlock
+}
+
+// existingMembershipStream is the data stream an object is already on.
+// GetSource / GetNamespace can include extra names (including the stream this
+// Create is requesting). Membership is a single stream, so skip plannedStream
+// when another name is present.
+func existingMembershipStream(streams []string, plannedStream string) string {
+	for _, s := range streams {
+		if s != plannedStream {
+			return s
+		}
+	}
+	return streams[0]
+}
+
+// sourceNotYetCreated reports whether GetSource failed because there is no
+// InstrumentationConfig CRD. That is the first-create case, and also what
+// Odigos returns after selected=false removes the last stream label (the
+// Source CRD is deleted). It is not a transport or GraphQL failure.
+func sourceNotYetCreated(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "not found") &&
+		(strings.Contains(msg, "InstrumentationConfig") ||
+			strings.Contains(msg, "instrumentationconfigs.odigos.io"))
+}
+
+func annotateDuplicateSourceError(err error) string {
+	msg := err.Error()
+	if strings.Contains(msg, "expected to get 1 source") {
+		return msg + ". Delete extra Source CRDs for this workload and retry."
+	}
+	return msg
 }
 
 func (c *cachedOdigosClient) GetComputePlatforms(ctx context.Context) ([]odigostypes.ComputePlatform, error) {

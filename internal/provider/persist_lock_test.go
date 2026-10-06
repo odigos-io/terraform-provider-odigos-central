@@ -14,7 +14,7 @@ import (
 
 func TestLockPersistSerializesSameKey(t *testing.T) {
 	c := &cachedOdigosClient{}
-	var inFlight, max atomic.Int32
+	var inFlight, maxInFlight atomic.Int32
 	var wg sync.WaitGroup
 	for range 4 {
 		wg.Add(1)
@@ -24,8 +24,8 @@ func TestLockPersistSerializesSameKey(t *testing.T) {
 			defer unlock()
 			n := inFlight.Add(1)
 			for {
-				m := max.Load()
-				if n <= m || max.CompareAndSwap(m, n) {
+				m := maxInFlight.Load()
+				if n <= m || maxInFlight.CompareAndSwap(m, n) {
 					break
 				}
 			}
@@ -34,8 +34,8 @@ func TestLockPersistSerializesSameKey(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	if got := max.Load(); got != 1 {
-		t.Errorf("max in-flight = %d, want 1", got)
+	if got := maxInFlight.Load(); got != 1 {
+		t.Errorf("maxInFlight in-flight = %d, want 1", got)
 	}
 }
 

@@ -675,7 +675,7 @@ func TestNamespaceDeleteFallsBackToCurrentStream(t *testing.T) {
 }
 
 func TestNamespaceDeleteSerializesSameNamespace(t *testing.T) {
-	var inFlight, max atomic.Int32
+	var inFlight, maxInFlight atomic.Int32
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Query     string         `json:"query"`
@@ -696,8 +696,8 @@ func TestNamespaceDeleteSerializesSameNamespace(t *testing.T) {
 			if strings.Contains(innerQuery, "persistK8sNamespaces") {
 				n := inFlight.Add(1)
 				for {
-					m := max.Load()
-					if n <= m || max.CompareAndSwap(m, n) {
+					m := maxInFlight.Load()
+					if n <= m || maxInFlight.CompareAndSwap(m, n) {
 						break
 					}
 				}
@@ -753,7 +753,7 @@ func TestNamespaceDeleteSerializesSameNamespace(t *testing.T) {
 		}
 	}()
 	wg.Wait()
-	if max.Load() != 1 {
-		t.Errorf("max concurrent persist = %d, want 1", max.Load())
+	if maxInFlight.Load() != 1 {
+		t.Errorf("maxInFlight concurrent persist = %d, want 1", maxInFlight.Load())
 	}
 }

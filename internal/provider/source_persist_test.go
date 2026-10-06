@@ -984,7 +984,7 @@ func TestSourceDeleteFallsBackToCurrentStream(t *testing.T) {
 }
 
 func TestSourceDeleteSerializesSameWorkload(t *testing.T) {
-	var inFlight, max atomic.Int32
+	var inFlight, maxInFlight atomic.Int32
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Query     string         `json:"query"`
@@ -998,8 +998,8 @@ func TestSourceDeleteSerializesSameWorkload(t *testing.T) {
 		if strings.Contains(innerQuery, "persistK8sSources") {
 			n := inFlight.Add(1)
 			for {
-				m := max.Load()
-				if n <= m || max.CompareAndSwap(m, n) {
+				m := maxInFlight.Load()
+				if n <= m || maxInFlight.CompareAndSwap(m, n) {
 					break
 				}
 			}
@@ -1052,13 +1052,13 @@ func TestSourceDeleteSerializesSameWorkload(t *testing.T) {
 		}
 	}()
 	wg.Wait()
-	if max.Load() != 1 {
-		t.Errorf("max concurrent persist = %d, want 1", max.Load())
+	if maxInFlight.Load() != 1 {
+		t.Errorf("maxInFlight concurrent persist = %d, want 1", maxInFlight.Load())
 	}
 }
 
 func TestSourceCreateSerializesSameWorkload(t *testing.T) {
-	var inFlight, max atomic.Int32
+	var inFlight, maxInFlight atomic.Int32
 	var persistCount atomic.Int32
 	populated := `{"type":"","data":{"computePlatform":{"source":{"namespace":"default","name":"my-deploy","kind":"Deployment","dataStreamNames":["alpha"],"selected":true,"otelServiceName":"my-deploy","containers":[],"conditions":[]}}},"request_id":""}`
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1075,8 +1075,8 @@ func TestSourceCreateSerializesSameWorkload(t *testing.T) {
 		case strings.Contains(innerQuery, "persistK8sSources"):
 			n := inFlight.Add(1)
 			for {
-				m := max.Load()
-				if n <= m || max.CompareAndSwap(m, n) {
+				m := maxInFlight.Load()
+				if n <= m || maxInFlight.CompareAndSwap(m, n) {
 					break
 				}
 			}
@@ -1143,7 +1143,7 @@ func TestSourceCreateSerializesSameWorkload(t *testing.T) {
 	if errCount.Load() != 1 {
 		t.Errorf("create errors = %d, want 1 (second resource rejected)", errCount.Load())
 	}
-	if max.Load() != 1 {
-		t.Errorf("max concurrent persist = %d, want 1", max.Load())
+	if maxInFlight.Load() != 1 {
+		t.Errorf("maxInFlight concurrent persist = %d, want 1", maxInFlight.Load())
 	}
 }

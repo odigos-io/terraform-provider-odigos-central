@@ -55,14 +55,20 @@ signs:
       - "--detach-sign"
       - "${artifact}"
 release:
-  # ci-core/tag-and-release creates the release as a draft before this runs, so a
-  # re-run re-uploads over assets that are already attached. Without this goreleaser
-  # 422s on the first duplicate name.
+  # ci-core/tag-and-release creates the release as a draft before this runs, and
+  # GitHub's get-release-by-tag endpoint does not return drafts. Without this
+  # goreleaser cannot find that draft, creates a second release for the same tag,
+  # and publishes its own empty-bodied one while the real notes stay in the orphan.
+  # Matching by name works: ci-core titles the draft with the tag, which is also
+  # goreleaser's default release name_template.
+  use_existing_draft: true
+  # A re-run re-uploads over assets that are already attached. Without this
+  # goreleaser 422s on the first duplicate name.
   replace_existing_artifacts: true
   extra_files:
     - glob: 'terraform-registry-manifest.json'
       name_template: '{{ .ProjectName }}_{{ .Version }}_manifest.json'
-  # If you want to manually examine the release before its live, uncomment this line:
-  # draft: true
+  # Leave `draft` unset: goreleaser un-drafts the release once the signed archives
+  # are attached, which is what makes the Terraform Registry ingest a complete one.
 changelog:
   disable: true

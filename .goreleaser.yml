@@ -55,6 +55,10 @@ signs:
       - "--detach-sign"
       - "${artifact}"
 release:
+  # ci-core/tag-and-release creates the release as a draft before this runs, so a
+  # re-run re-uploads over assets that are already attached. Without this goreleaser
+  # 422s on the first duplicate name.
+  replace_existing_artifacts: true
   extra_files:
     - glob: 'terraform-registry-manifest.json'
       name_template: '{{ .ProjectName }}_{{ .Version }}_manifest.json'

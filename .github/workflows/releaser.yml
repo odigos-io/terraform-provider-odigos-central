@@ -1,31 +1,136 @@
-# .github/workflows/release.yml
-name: Release
+name: Tag and Release
+run-name: "Tag and Release · ${{ inputs.bump }} on ${{ inputs.base_branch }}"
+
+# Manually triggered release. Version bump logic lives in ci-core's
+# tag-and-release/calculate.js.
+#
+# Flow:
+#   calculate → confirm (release-gate) → tag → goreleaser → linear-release
+#
+# tag-and-release creates the GitHub release as a DRAFT. The Terraform Registry
+# ingests on the release-published webhook, so a published-but-empty release would
+# register a version with no artifacts — and published registry versions are
+# permanent. goreleaser uploads the signed archives and then publishes the draft,
+# so the registry only ever sees a complete release.
+
+concurrency:
+  group: tag-and-release
+  cancel-in-progress: false
+
+permissions: read-all
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options: [patch, minor, major]
+      base_branch:
+        description: "Base branch to tag"
+        required: true
+        default: main
+        type: string
       snapshot:
-        description: Build and sign without publishing a GitHub Release
+        description: "Dry run: build and sign locally, create no tag and no release"
         type: boolean
-        default: true
-
-permissions:
-  contents: write
+        default: false
 
 jobs:
-  goreleaser:
+  # ── Dry run: no tag, no release, nothing published ──────────────────────────
+  snapshot:
+    if: ${{ inputs.snapshot }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+      - name: Import GPG key
+        id: import_gpg
+        uses: crazy-max/ghaction-import-gpg@v7
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+      - uses: goreleaser/goreleaser-action@v7
+        with:
+          version: "~> v2"
+          args: release --snapshot --clean
+        env:
+          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
+  calculate:
+    if: ${{ !inputs.snapshot }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      new_version: ${{ steps.calc.outputs.new_version }}
+      current_version: ${{ steps.calc.outputs.current_version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+          fetch-tags: true
+      - id: calc
+        uses: odigos-io/ci-core/tag-and-release@main
+        with:
+          operation: calculate
+          bump: ${{ inputs.bump }}
+          base_branch: ${{ inputs.base_branch }}
+
+  confirm:
+    needs: calculate
+    runs-on: ubuntu-latest
+    environment: release-gate
+    steps:
+      - run: echo "Releasing ${{ needs.calculate.outputs.new_version }} from ${{ inputs.base_branch }}"
+
+  tag:
+    needs: [calculate, confirm]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.base_branch }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false # STS handles auth
+      - uses: odigos-io/ci-core/tag-and-release@main
+        with:
+          operation: tag
+          bump: ${{ inputs.bump }}
+          base_branch: ${{ inputs.base_branch }}
+          sts_identity: tag-releaser
+          new_version: ${{ needs.calculate.outputs.new_version }}
+          # Scopes the generated notes; without it GitHub starts from the repo's
+          # first commit.
+          previous_version: ${{ needs.calculate.outputs.current_version }}
+          # goreleaser publishes it once the signed archives are attached.
+          draft_release: "true"
+          create_branch: "false"
+          release_branch: ""
+          actor: ${{ github.actor }}
+          run_url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  goreleaser:
+    needs: [calculate, tag]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # upload assets to, and publish, the drafted release
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.calculate.outputs.new_version }} # the tag the previous job pushed
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-go@v6
         with:
           go-version-file: 'go.mod'
 
@@ -39,7 +144,60 @@ jobs:
         uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
-          args: ${{ github.event_name == 'workflow_dispatch' && inputs.snapshot && 'release --snapshot --clean' || 'release --clean' }}
+          args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
+          GORELEASER_CURRENT_TAG: ${{ needs.calculate.outputs.new_version }}
+
+      # Publishing is what makes the Terraform Registry ingest the version, so it
+      # happens only after the archives, checksums and signature are attached.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.calculate.outputs.new_version }}
+        run: |
+          set -euo pipefail
+          gh release edit "${TAG}" --draft=false
+          echo "::notice::published ${TAG}; the Terraform Registry will ingest it now."
+
+  # Records the release in Linear with the issues that shipped in it. Its own job so
+  # the third-party CLI never sees the STS or GPG material, and so a Linear outage
+  # cannot fail a release that has already shipped.
+  linear-release:
+    needs: [calculate, tag, goreleaser]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.calculate.outputs.new_version }}
+          fetch-depth: 0 # the scan walks commit history
+          fetch-tags: true
+
+      - name: Fetch the GitHub release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.calculate.outputs.new_version }}
+        run: |
+          set -uo pipefail
+          if ! gh release view "${VERSION}" --repo "${GITHUB_REPOSITORY}" \
+               --json body --jq .body > release-notes.md; then
+            echo "::warning::could not read the GitHub release notes for ${VERSION}"
+          fi
+          # Whitespace-only is worse than nothing: an empty note still occupies the
+          # slot in Linear and suppresses its own generation.
+          grep -q '[^[:space:]]' release-notes.md 2>/dev/null || rm -f release-notes.md
+
+      - uses: odigos-io/ci-core/linear-release@main
+        with:
+          access-key: ${{ secrets.LINEAR_RELEASE_ACCESS_KEY }}
+          name: ${{ needs.calculate.outputs.new_version }}
+          version: ${{ needs.calculate.outputs.new_version }}
+          release-notes: release-notes.md
+          # Usually a tag on another release branch; the action resolves such a ref
+          # to the fork point rather than failing the scan.
+          base-ref: ${{ needs.calculate.outputs.current_version }}
+          links: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.calculate.outputs.new_version }}

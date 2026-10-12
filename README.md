@@ -4,21 +4,6 @@ Manages [Odigos Central](https://odigos.io): connected clusters, namespace selec
 
 Registry source: `odigos-io/odigos-central`.
 
-> **Not yet published.** The provider is not on the Terraform Registry yet, so
-> `terraform init` cannot download it. Until the first release, build it from
-> source and point Terraform at the binary with a
-> [`dev_overrides`](https://developer.hashicorp.com/terraform/cli/config/config-file#development-overrides)
-> block in `~/.terraformrc`:
->
-> ```hcl
-> provider_installation {
->   dev_overrides {
->     "odigos-io/odigos-central" = "/path/to/your/go/bin"
->   }
->   direct {}
-> }
-> ```
-
 ## Requirements
 
 - [Terraform](https://developer.hashicorp.com/terraform/downloads) >= 1.0
